@@ -290,7 +290,7 @@ func (c *Cache) GetState() *state.CacheState {
 	var fill int64 = 0
 
 	scan := c.getPieces()
-	if patchOn && settings.BTsets != nil && !settings.BTsets.UseDisk && c.active != nil {
+	if patchOn && settings.BTsets != nil && c.active != nil {
 		scan = c.activeSnapshot()
 	}
 	for _, p := range scan {
@@ -419,7 +419,7 @@ func (c *Cache) getRemPiecesX(applyPrio, full bool) []*Piece {
 
 	// Determine which chunks can be deleted
 	scan := c.getPieces()
-	if patchOn && settings.BTsets != nil && !settings.BTsets.UseDisk && c.active != nil {
+	if patchOn && settings.BTsets != nil && c.active != nil {
 		scan = c.activeSnapshot()
 	}
 	stats.scanned.Add(int64(len(scan)))

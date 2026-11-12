@@ -27,6 +27,9 @@ func NewDiskPiece(p *Piece) *DiskPiece {
 		p.Size = ff.Size()
 		p.Complete = ff.Size() == p.cache.pieceLength
 		p.Accessed = ff.ModTime().Unix()
+		if p.Size > 0 {
+			p.cache.markActive(p)
+		}
 	}
 	return &DiskPiece{piece: p, name: name}
 }
@@ -43,7 +46,11 @@ func (p *DiskPiece) WriteAt(b []byte, off int64) (n int, err error) {
 	defer ff.Close()
 	n, err = ff.WriteAt(b, off)
 
+	wasEmpty := p.piece.Size == 0
 	p.piece.Size += int64(n)
+	if wasEmpty && n > 0 {
+		p.piece.cache.markActive(p.piece)
+	}
 	if p.piece.Size > p.piece.cache.pieceLength {
 		p.piece.Size = p.piece.cache.pieceLength
 	}
@@ -78,8 +85,12 @@ func (p *DiskPiece) Release() {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 
+	if err := os.Remove(p.name); err != nil && !os.IsNotExist(err) {
+		log.TLogln("Error removing cache piece:", err)
+		return
+	}
+
 	p.piece.Size = 0
 	p.piece.Complete = false
-
-	os.Remove(p.name)
+	p.piece.cache.unmarkActive(p.piece.Id)
 }
