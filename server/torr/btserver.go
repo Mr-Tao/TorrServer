@@ -8,6 +8,7 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"os"
 	"sync"
 	"time"
 
@@ -126,6 +127,7 @@ func (bt *BTServer) configure() {
 	// Encryption/Obfuscation
 	bt.config.EncryptionPolicy = torrent.EncryptionPolicy{ //	OE
 		ForceEncryption: settings.BTsets.ForceEncrypt, //	OE
+		PreferNoEncryption: !settings.BTsets.ForceEncrypt && os.Getenv("TS_PREFER_PLAIN") == "1",
 	} //	OE
 	// bt.config.HeaderObfuscationPolicy = torrent.HeaderObfuscationPolicy{ //	NE
 	// 	RequirePreferred: settings.BTsets.ForceEncrypt, //	NE

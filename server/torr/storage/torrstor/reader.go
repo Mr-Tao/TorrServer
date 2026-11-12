@@ -125,7 +125,11 @@ func (r *Reader) Close() {
 	if len(r.file.Torrent().Files()) > 0 {
 		r.Reader.Close()
 	}
-	go r.cache.getRemPieces()
+	if patchOn {
+		go r.cache.getRemPiecesX(true, false)
+	} else {
+		go r.cache.getRemPieces()
+	}
 }
 
 func (r *Reader) getPiecesRange() Range {
