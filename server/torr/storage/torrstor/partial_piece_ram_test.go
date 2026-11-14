@@ -34,11 +34,11 @@ func TestPartialPieceRAMAccounting(t *testing.T) {
 
     var allocated int64
     for _, p := range c.pieces {
-        allocated += int64(cap(p.mPiece.buffer))
+        allocated += p.mPiece.allocated()
     }
     t.Logf("capacity=%d MiB, filled=%d MiB, allocated=%d MiB",
         c.capacity>>20, c.filled>>20, allocated>>20)
-    if c.filled < allocated {
+    if c.filled != allocated {
         t.Errorf("eviction accounts for %d bytes, but RAM buffers hold %d bytes",
             c.filled, allocated)
     }
