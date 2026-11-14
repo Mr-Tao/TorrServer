@@ -1,6 +1,7 @@
 package torrstor
 
 import (
+	"errors"
 	"github.com/anacrolix/torrent"
 	"github.com/anacrolix/torrent/storage"
 	"server/settings"
@@ -142,14 +143,24 @@ func (p *Piece) Completion() storage.Completion {
 	}
 }
 
-func (p *Piece) Release() {
-	if !settings.BTsets.UseDisk {
-		p.mPiece.Release()
-	} else {
-		p.dPiece.Release()
+func (p *Piece) Release() error {
+	if p.mPiece != nil {
+		if p.cache == nil || p.cache.torrent == nil {
+			return errors.New("torrstor: torrent not available")
+		}
+
+		tp := p.cache.torrent.Piece(p.Id)
+
+		return tp.DiscardAllChunks(func() error {
+			p.mPiece.Release()
+			return nil
+		})
 	}
-	// if !p.cache.isClosed {
+
+	// Preserve the original disk-cache behavior.
+	p.dPiece.Release()
 	p.cache.torrent.Piece(p.Id).SetPriority(torrent.PiecePriorityNone)
 	p.cache.torrent.Piece(p.Id).UpdateCompletion()
-	//}
+
+	return nil
 }

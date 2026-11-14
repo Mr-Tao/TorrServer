@@ -34,6 +34,18 @@ func localTorrentConfig() *torrent.ClientConfig {
 }
 
 func TestStreamingSegmentRedownload(t *testing.T) {
+	runStreamingRedownload(t, false, false)
+}
+
+func TestStreamingWholePieceRelease(t *testing.T) {
+	runStreamingRedownload(t, true, false)
+}
+
+func TestStreamingCompletedPieceRelease(t *testing.T) {
+	runStreamingRedownload(t, false, true)
+}
+
+func runStreamingRedownload(t *testing.T, wholePiece bool, completedPiece bool) {
 	// Configure an isolated RAM-cache test.
 	// Restore global settings after the test finishes.
 	previousSets := settings.BTsets
@@ -116,6 +128,35 @@ func TestStreamingSegmentRedownload(t *testing.T) {
 		t.Fatal("seeder piece failed verification")
 	}
 
+	if completedPiece {
+		p := seedCache.pieces[0]
+
+		if missing := seedTorrent.PieceBytesMissing(0); missing != 0 {
+			t.Fatalf("verified piece has %d missing bytes", missing)
+		}
+
+		if err := p.Release(); err != nil {
+			t.Fatalf("completed piece release: %v", err)
+		}
+
+		if seedTorrent.PieceState(0).Completion.Complete {
+			t.Fatal("released piece still marked complete")
+		}
+
+		if missing := seedTorrent.PieceBytesMissing(0); missing != pieceLength {
+			t.Fatalf(
+				"missing after release: got %d, want %d",
+				missing, pieceLength,
+			)
+		}
+
+		if allocated := p.mPiece.allocated(); allocated != 0 {
+			t.Fatalf("released piece retains %d bytes", allocated)
+		}
+
+		return
+	}
+
 	// Leecher: our modified TorrServer RAM cache.
 	stor := NewStorage(16 << 20)
 	leechCfg := localTorrentConfig()
@@ -165,6 +206,66 @@ func TestStreamingSegmentRedownload(t *testing.T) {
 
 	if leechTorrent.PieceState(0).Completion.Complete {
 		t.Fatal("piece completed before discard")
+	}
+	if wholePiece {
+		before := leechTorrent.PieceBytesMissing(0)
+
+		if before >= pieceLength {
+			t.Fatal("no torrent chunks received before release")
+		}
+
+		// This is the legacy, uncoordinated eviction path.
+		deadline := time.Now().Add(3 * time.Second)
+
+		for {
+			err = cache.pieces[0].Release()
+
+			if !errors.Is(err, torrent.ErrChunkDiscardBusy) {
+				break
+			}
+
+			if time.Now().After(deadline) {
+				t.Fatal("whole-piece release stayed busy")
+			}
+
+			time.Sleep(10 * time.Millisecond)
+		}
+
+		if err != nil {
+			t.Fatalf("whole-piece release: %v", err)
+		}
+
+		if allocated := cache.pieces[0].mPiece.allocated(); allocated != 0 {
+			t.Fatalf("release retained %d bytes", allocated)
+		}
+
+		after := leechTorrent.PieceBytesMissing(0)
+
+		if after != pieceLength {
+			t.Fatalf(
+				"ghost chunks after release: missing=%d, want=%d",
+				after, pieceLength,
+			)
+		}
+
+		// The entire piece was discarded. Its first block must
+		// be fetched again from the seeder.
+		if _, err := reader.Seek(0, io.SeekStart); err != nil {
+			t.Fatal(err)
+		}
+
+		again := make([]byte, blockSize)
+		n, err = reader.ReadContext(ctx, again)
+
+		if err != nil || n != blockSize {
+			t.Fatalf("read after release: n=%d err=%v", n, err)
+		}
+
+		if !bytes.Equal(again, data[:blockSize]) {
+			t.Fatal("re-downloaded data mismatch")
+		}
+
+		return
 	}
 
 	// Discard the 256 KiB segment containing the received block.

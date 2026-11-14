@@ -265,10 +265,11 @@ func (c *Cache) Close() error {
 	return nil
 }
 
-func (c *Cache) removePiece(piece *Piece) {
-	if !c.isClosed.Load() {
-		piece.Release()
+func (c *Cache) removePiece(piece *Piece) bool {
+	if c.isClosed.Load() {
+		return false
 	}
+	return piece.Release() == nil
 }
 
 func (c *Cache) AdjustRA(readahead int64) {
@@ -367,22 +368,32 @@ func (c *Cache) cleanPieces() {
 		remPieces := c.getRemPiecesX(apply, false)
 		stats.cleanRuns.Add(1)
 		if c.filled > c.capacity {
-			rems := (c.filled-c.capacity)/c.pieceLength + 1
+			released := false
+
 			for _, p := range remPieces {
-				c.removePiece(p)
-				stats.removed.Add(1)
-				rems--
-				if rems <= 0 {
-					g0 := time.Now()
-					if patchOn {
-						utils.FreeOSMemGCThrottled()
-					} else {
-						utils.FreeOSMemGC()
-					}
-					stats.gcCalls.Add(1)
-					stats.gcNs.Add(int64(time.Since(g0)))
+				if c.filled <= c.capacity {
 					break
 				}
+
+				before := p.memCost()
+				if before == 0 {
+					continue
+				}
+
+				if !c.removePiece(p) {
+					// A busy piece must not be counted as evicted.
+					continue
+				}
+
+				after := p.memCost()
+				if before > after {
+					c.filled -= before - after
+					released = true
+				}
+			}
+
+			if released {
+				utils.FreeOSMemGC()
 			}
 		}
 		stats.cleanNs.Add(int64(time.Since(t0)))
