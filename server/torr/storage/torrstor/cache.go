@@ -424,18 +424,19 @@ func (c *Cache) getRemPiecesX(applyPrio, full bool) []*Piece {
 	}
 	stats.scanned.Add(int64(len(scan)))
 	for id, p := range scan {
-		if p.Size > 0 {
+		m := p.meta()
+		if m.size > 0 {
 			fill += p.memCost()
 		}
 		if len(ranges) > 0 {
 			if !inRanges(ranges, id) {
-				if p.Size > 0 && !c.isIdInFileBE(ranges, id) {
+				if m.size > 0 && !c.isIdInFileBE(ranges, id) {
 					piecesRemove = append(piecesRemove, p)
 				}
 			}
 		} else {
 			// When preloading, clear everything except the beginning and end of the file
-			if p.Size > 0 && !c.isIdInFileBE(ranges, id) {
+			if m.size > 0 && !c.isIdInFileBE(ranges, id) {
 				piecesRemove = append(piecesRemove, p)
 			}
 		}
@@ -454,10 +455,13 @@ func (c *Cache) getRemPiecesX(applyPrio, full bool) []*Piece {
 	// client never re-requests chunks it has received, so evicting their bytes makes a
 	// responsive reader that comes back to them read zeros.
 	sort.Slice(piecesRemove, func(i, j int) bool {
-		if piecesRemove[i].Complete != piecesRemove[j].Complete {
-			return piecesRemove[i].Complete
+		a := piecesRemove[i].meta()
+		b := piecesRemove[j].meta()
+
+		if a.complete != b.complete {
+			return a.complete
 		}
-		return piecesRemove[i].Accessed < piecesRemove[j].Accessed
+		return a.accessed < b.accessed
 	})
 
 	c.filled = fill

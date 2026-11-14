@@ -4,6 +4,8 @@ import (
 	"github.com/anacrolix/torrent"
 	"github.com/anacrolix/torrent/storage"
 	"server/settings"
+	"sync"
+	"time"
 )
 
 type Piece struct {
@@ -18,7 +20,69 @@ type Piece struct {
 	mPiece *MemPiece  `json:"-"`
 	dPiece *DiskPiece `json:"-"`
 
-	cache *Cache `json:"-"`
+	cache  *Cache `json:"-"`
+	metaMu sync.RWMutex
+}
+
+type pieceMeta struct {
+	size     int64
+	complete bool
+	accessed int64
+}
+
+func (p *Piece) meta() pieceMeta {
+	p.metaMu.RLock()
+	defer p.metaMu.RUnlock()
+
+	return pieceMeta{
+		size:     p.Size,
+		complete: p.Complete,
+		accessed: p.Accessed,
+	}
+}
+
+func (p *Piece) noteWrite(n int, length int64) {
+	p.metaMu.Lock()
+	defer p.metaMu.Unlock()
+
+	p.Size += int64(n)
+	if p.Size > length {
+		p.Size = length
+	}
+	p.Accessed = time.Now().Unix()
+}
+
+func (p *Piece) touch() {
+	p.metaMu.Lock()
+	p.Accessed = time.Now().Unix()
+	p.metaMu.Unlock()
+}
+
+func (p *Piece) setComplete(v bool) {
+	p.metaMu.Lock()
+	p.Complete = v
+	p.metaMu.Unlock()
+}
+
+func (p *Piece) resetMeta() {
+	p.metaMu.Lock()
+	p.Size = 0
+	p.Complete = false
+	p.metaMu.Unlock()
+}
+
+func (p *Piece) clearSize() {
+	p.metaMu.Lock()
+	p.Size = 0
+	p.metaMu.Unlock()
+}
+
+func (p *Piece) initMeta(size int64, complete bool, accessed int64) {
+	p.metaMu.Lock()
+	p.Size = size
+	p.Complete = complete
+	p.Accessed = accessed
+	p.metaMu.Unlock()
 }
 
 func NewPiece(id int, cache *Cache) *Piece {
@@ -58,22 +122,22 @@ func (p *Piece) memCost() int64 {
 	if p.mPiece != nil {
 		return p.mPiece.allocated()
 	}
-	return p.Size
+	return p.meta().size
 }
 
 func (p *Piece) MarkComplete() error {
-	p.Complete = true
+	p.setComplete(true)
 	return nil
 }
 
 func (p *Piece) MarkNotComplete() error {
-	p.Complete = false
+	p.setComplete(false)
 	return nil
 }
 
 func (p *Piece) Completion() storage.Completion {
 	return storage.Completion{
-		Complete: p.Complete,
+		Complete: p.meta().complete,
 		Ok:       true,
 	}
 }

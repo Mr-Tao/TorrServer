@@ -1,9 +1,9 @@
 package torrstor
 
 import (
+	"fmt"
 	"io"
 	"sync"
-	"time"
 )
 
 const memSegmentSize int64 = 256 << 10
@@ -69,11 +69,7 @@ func (p *MemPiece) WriteAt(b []byte, off int64) (n int, err error) {
 		off += int64(count)
 	}
 
-	p.piece.Size += int64(n)
-	if p.piece.Size > length {
-		p.piece.Size = length
-	}
-	p.piece.Accessed = time.Now().Unix()
+	p.piece.noteWrite(n, length)
 
 	if wasEmpty {
 		p.piece.cache.markActive(p.piece)
@@ -132,9 +128,9 @@ func (p *MemPiece) ReadAt(b []byte, off int64) (n int, err error) {
 		n += count
 	}
 
-	p.piece.Accessed = time.Now().Unix()
+	p.piece.touch()
 
-	if off+int64(len(b)) >= p.piece.Size {
+	if off+int64(len(b)) >= p.piece.meta().size {
 		go p.piece.cache.cleanPieces()
 	}
 
@@ -158,7 +154,81 @@ func (p *MemPiece) Release() {
 	p.bytes = 0
 	p.lastCleanupBytes = 0
 
-	p.piece.Size = 0
-	p.piece.Complete = false
+	p.piece.resetMeta()
 	p.piece.cache.unmarkActive(p.piece.Id)
+}
+
+type discardRangeFunc func(
+	begin, length int64,
+	discard func() error,
+) (int, error)
+
+// DiscardSegment removes one allocated 256 KiB segment and
+// invalidates its torrent chunks as one coordinated operation.
+//
+// The offset must be relative to the piece and segment-aligned.
+// This method does not decide whether the segment is safe to
+// evict from the perspective of active HTTP readers.
+func (p *MemPiece) DiscardSegment(offset int64) (int, error) {
+	if p == nil || p.piece == nil ||
+		p.piece.cache == nil ||
+		p.piece.cache.torrent == nil {
+		return 0, fmt.Errorf("torrstor: torrent not available")
+	}
+
+	tp := p.piece.cache.torrent.Piece(p.piece.Id)
+
+	return p.discardSegmentWith(
+		offset,
+		tp.DiscardChunkRange,
+	)
+}
+
+// Separate the storage operation from the torrent API so that
+// it can be tested without a running torrent client.
+func (p *MemPiece) discardSegmentWith(
+	offset int64,
+	invalidate discardRangeFunc,
+) (int, error) {
+	if p == nil || p.piece == nil ||
+		p.piece.cache == nil {
+		return 0, fmt.Errorf("torrstor: invalid memory piece")
+	}
+	if invalidate == nil {
+		return 0, fmt.Errorf("torrstor: missing invalidator")
+	}
+
+	length := p.piece.cache.pieceLength
+
+	if offset < 0 ||
+		offset >= length ||
+		offset%memSegmentSize != 0 {
+		return 0, fmt.Errorf(
+			"torrstor: invalid segment offset %d", offset,
+		)
+	}
+
+	segmentLength := min(memSegmentSize, length-offset)
+	index := offset / memSegmentSize
+
+	return invalidate(offset, segmentLength, func() error {
+		p.mu.Lock()
+		defer p.mu.Unlock()
+
+		if seg, ok := p.segments[index]; ok {
+			delete(p.segments, index)
+			p.bytes -= int64(cap(seg))
+		}
+
+		if p.bytes == 0 {
+			p.segments = nil
+			p.lastCleanupBytes = 0
+			p.piece.clearSize()
+			p.piece.cache.unmarkActive(p.piece.Id)
+		} else if p.lastCleanupBytes > p.bytes {
+			p.lastCleanupBytes = p.bytes
+		}
+
+		return nil
+	})
 }

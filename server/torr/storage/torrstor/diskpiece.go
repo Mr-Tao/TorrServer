@@ -24,10 +24,12 @@ func NewDiskPiece(p *Piece) *DiskPiece {
 	name := filepath.Join(settings.BTsets.TorrentsSavePath, p.cache.hash.HexString(), strconv.Itoa(p.Id))
 	ff, err := os.Stat(name)
 	if err == nil {
-		p.Size = ff.Size()
-		p.Complete = ff.Size() == p.cache.pieceLength
-		p.Accessed = ff.ModTime().Unix()
-		if p.Size > 0 {
+		p.initMeta(
+			ff.Size(),
+			ff.Size() == p.cache.pieceLength,
+			ff.ModTime().Unix(),
+		)
+		if p.meta().size > 0 {
 			p.cache.markActive(p)
 		}
 	}
