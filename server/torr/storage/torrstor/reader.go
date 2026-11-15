@@ -119,8 +119,6 @@ func (r *Reader) Read(p []byte) (n int, err error) {
 	}
 	defer r.endRead(readID)
 	if r.file.Torrent() != nil && r.file.Torrent().Info() != nil {
-		r.beginIO()
-		defer r.endIO()
 		n, err = r.Reader.ReadContext(r.readCtx, p)
 
 		// samsung tv fix xvid/divx

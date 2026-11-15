@@ -196,6 +196,14 @@ func (c *Cache) priorityWatchdog() {
 			continue
 		}
 		if c.GetUseReaders() > 0 {
+			c.muRemove.Lock()
+
+			// The cache may have closed while acquiring the lock.
+			if c.isClosed.Load() {
+				c.muRemove.Unlock()
+				return
+			}
+
 			if c.patchEnabled {
 				full := time.Since(c.lastFull) > 60*time.Second
 				if full {
@@ -205,6 +213,8 @@ func (c *Cache) priorityWatchdog() {
 			} else {
 				c.getRemPiecesX(true, true)
 			}
+
+			c.unlockMaintenance()
 		}
 	}
 }
@@ -306,7 +316,7 @@ func (c *Cache) GetState() *state.CacheState {
 	var fill int64 = 0
 
 	scan := c.getPieces()
-	if c.patchEnabled && settings.BTsets != nil && c.active != nil {
+	if c.patchEnabled && c.active != nil {
 		scan = c.activeSnapshot()
 	}
 
@@ -372,17 +382,7 @@ func (c *Cache) cleanPieces() {
 	c.isRemove.Store(true)
 	defer func() {
 		c.isRemove.Store(false)
-
-		// Decide while still holding muRemove.
-		rerun := c.patchEnabled &&
-			c.pendingClean.Load() &&
-			!c.isClosed.Load()
-
-		c.muRemove.Unlock()
-
-		if rerun {
-			go c.cleanPieces()
-		}
+		c.unlockMaintenance()
 	}()
 	// The cache may have been closed between the initial
 	// isClosed check and acquiring muRemove.
@@ -468,7 +468,7 @@ func (c *Cache) getRemPiecesX(applyPrio, full bool) []*Piece {
 
 	// Determine which chunks can be deleted
 	scan := c.getPieces()
-	if c.patchEnabled && settings.BTsets != nil && c.active != nil {
+	if c.patchEnabled && c.active != nil {
 		scan = c.activeSnapshot()
 	}
 	stats.scanned.Add(int64(len(scan)))
@@ -730,12 +730,27 @@ func (c *Cache) refreshReaderPriorities() {
 	}
 
 	c.muRemove.Lock()
-	defer c.muRemove.Unlock()
+	defer c.unlockMaintenance()
 
-	// The cache may have closed while we waited.
 	if c.isClosed.Load() {
 		return
 	}
 
 	c.getRemPieces()
+}
+
+// unlockMaintenance releases muRemove and schedules any cleanup
+// request that could not acquire the lock.
+//
+// The pending check must happen after unlocking:
+// a new cleanPieces call can otherwise set pendingClean
+// between the check and Unlock, then fail TryLock.
+func (c *Cache) unlockMaintenance() {
+	c.muRemove.Unlock()
+
+	if c.patchEnabled &&
+		c.pendingClean.Load() &&
+		!c.isClosed.Load() {
+		go c.cleanPieces()
+	}
 }
