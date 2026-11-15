@@ -462,8 +462,9 @@ func (r *Reader) finalizeClose() {
 		}
 	}
 
-	if c != nil {
-		go c.getRemPieces()
-		go c.clearPriority()
+	if c != nil && !c.isClosed.Load() {
+		// All cache maintenance must pass through cleanPieces,
+		// which serializes operations using muRemove.
+		go c.refreshReaderPriorities()
 	}
 }

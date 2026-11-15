@@ -5,6 +5,7 @@ import (
 	"context"
 	"crypto/sha1"
 	"errors"
+	"fmt"
 	"io"
 	"testing"
 	"time"
@@ -34,18 +35,25 @@ func localTorrentConfig() *torrent.ClientConfig {
 }
 
 func TestStreamingSegmentRedownload(t *testing.T) {
-	runStreamingRedownload(t, false, false)
+	runStreamingRedownload(t, false, false, false)
 }
 
 func TestStreamingWholePieceRelease(t *testing.T) {
-	runStreamingRedownload(t, true, false)
+	runStreamingRedownload(t, true, false, false)
 }
 
 func TestStreamingCompletedPieceRelease(t *testing.T) {
-	runStreamingRedownload(t, false, true)
+	runStreamingRedownload(t, false, true, false)
 }
 
-func runStreamingRedownload(t *testing.T, wholePiece bool, completedPiece bool) {
+func TestStreamingProtectedSegmentRedownload(t *testing.T) {
+	runStreamingRedownload(t, false, false, true)
+}
+
+func runStreamingRedownload(
+	t *testing.T,
+	wholePiece, completedPiece, protectedEviction bool,
+) {
 	// Configure an isolated RAM-cache test.
 	// Restore global settings after the test finishes.
 	previousSets := settings.BTsets
@@ -179,7 +187,13 @@ func runStreamingRedownload(t *testing.T, wholePiece bool, completedPiece bool) 
 	}
 
 	// Leecher: our modified TorrServer RAM cache.
-	leechStor := NewStorage(16 << 20)
+	leechCapacity := int64(16 << 20)
+
+	if protectedEviction {
+		leechCapacity = 512 << 10
+	}
+
+	leechStor := NewStorage(leechCapacity)
 	leechCfg := localTorrentConfig()
 	leechCfg.DefaultStorage = leechStor
 	leechCfg.Seed = false
@@ -205,6 +219,13 @@ func runStreamingRedownload(t *testing.T, wholePiece bool, completedPiece bool) 
 	cachesToDrain = append(cachesToDrain, leechCache)
 
 	leechCache.SetTorrent(leechTorrent)
+
+	if protectedEviction {
+		// Prevent background cleanup from evicting our test
+		// segments before the explicit eviction operation.
+		leechCache.muRemove.Lock()
+		defer leechCache.muRemove.Unlock()
+	}
 
 	leechTorrent.AddClientPeer(seeder)
 
@@ -287,6 +308,153 @@ func runStreamingRedownload(t *testing.T, wholePiece bool, completedPiece bool) 
 
 		if !bytes.Equal(again, data[:blockSize]) {
 			t.Fatal("re-downloaded data mismatch")
+		}
+
+		return
+	}
+
+	if protectedEviction {
+		const farOffset int64 = 2 << 20
+
+		// Download a real torrent block in a distant segment.
+		if _, err := reader.Seek(farOffset, io.SeekStart); err != nil {
+			t.Fatal(err)
+		}
+
+		far := make([]byte, blockSize)
+		n, err := reader.ReadContext(ctx, far)
+		if err != nil || n != blockSize {
+			t.Fatalf("far read: n=%d err=%v", n, err)
+		}
+		if !bytes.Equal(far, data[int(farOffset):int(farOffset)+blockSize]) {
+			t.Fatal("far segment data mismatch")
+		}
+
+		m := leechCache.pieces[0].mPiece
+
+		// Both segments must physically exist in RAM.
+		allocated := m.allocatedSegmentOffsets()
+		hasOffset := func(offsets []int64, wanted int64) bool {
+			for _, off := range offsets {
+				if off == wanted {
+					return true
+				}
+			}
+			return false
+		}
+
+		if !hasOffset(allocated, 0) ||
+			!hasOffset(allocated, farOffset) {
+			t.Fatalf("missing test segments: %v", allocated)
+		}
+
+		// Register a cache-managed reader with an in-flight
+		// range in the first segment.
+		tracked := leechCache.NewReader(leechTorrent.Files()[0])
+		tracked.SetReadahead(0)
+
+		readID, _, ok := tracked.beginRead(blockSize)
+		if !ok {
+			t.Fatal("could not register in-flight read")
+		}
+
+		defer func() {
+			tracked.endRead(readID)
+			leechCache.CloseReader(tracked)
+		}()
+
+		missingBefore := leechTorrent.PieceBytesMissing(0)
+
+		// Selection and invalidation must use one stable
+		// snapshot under the exclusive eviction barrier.
+		deadline := time.Now().Add(3 * time.Second)
+
+		for {
+			err = leechCache.withStableReaderWindows(
+				func(protected []byteInterval) error {
+					candidates := m.evictableSegmentOffsets(
+						0,
+						pieceLength,
+						memSegmentSize,
+						protected,
+					)
+
+					if hasOffset(candidates, 0) {
+						return fmt.Errorf(
+							"active segment selected for eviction",
+						)
+					}
+
+					if !hasOffset(candidates, farOffset) {
+						return fmt.Errorf(
+							"far segment not evictable: %v",
+							candidates,
+						)
+					}
+
+					_, err := m.DiscardSegment(farOffset)
+					return err
+				},
+			)
+
+			if !errors.Is(err, torrent.ErrChunkDiscardBusy) {
+				break
+			}
+
+			if time.Now().After(deadline) {
+				t.Fatal("protected eviction stayed busy")
+			}
+
+			time.Sleep(10 * time.Millisecond)
+		}
+
+		if err != nil {
+			t.Fatalf("protected eviction: %v", err)
+		}
+
+		allocated = m.allocatedSegmentOffsets()
+
+		if !hasOffset(allocated, 0) {
+			t.Fatal("protected segment was evicted")
+		}
+		if hasOffset(allocated, farOffset) {
+			t.Fatal("distant segment remains allocated")
+		}
+
+		// Torrent metadata must also reflect the invalidation.
+		missingAfter := leechTorrent.PieceBytesMissing(0)
+		if missingAfter <= missingBefore {
+			t.Fatalf(
+				"torrent chunks not invalidated: before=%d after=%d",
+				missingBefore,
+				missingAfter,
+			)
+		}
+
+		// Check that the protected data is still intact.
+		kept := make([]byte, blockSize)
+		n, err = m.ReadAt(kept, 0)
+		if err != nil || n != blockSize ||
+			!bytes.Equal(kept, data[:blockSize]) {
+			t.Fatalf("protected data changed: n=%d err=%v", n, err)
+		}
+
+		// Finally, re-download the segment that was evicted.
+		if _, err := reader.Seek(farOffset, io.SeekStart); err != nil {
+			t.Fatal(err)
+		}
+
+		again := make([]byte, blockSize)
+		n, err = reader.ReadContext(ctx, again)
+		if err != nil || n != blockSize {
+			t.Fatalf("redownload: n=%d err=%v", n, err)
+		}
+
+		if !bytes.Equal(
+			again,
+			data[int(farOffset):int(farOffset)+blockSize],
+		) {
+			t.Fatal("re-downloaded segment data mismatch")
 		}
 
 		return

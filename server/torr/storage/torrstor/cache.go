@@ -720,3 +720,22 @@ func (c *Cache) registerReader(r *Reader) {
 
 	c.readers[r] = struct{}{}
 }
+
+// refreshReaderPriorities updates priorities after a reader closes.
+// Serialize it with cache cleanup so test teardown and other
+// maintenance operations can wait for its completion.
+func (c *Cache) refreshReaderPriorities() {
+	if c.isClosed.Load() {
+		return
+	}
+
+	c.muRemove.Lock()
+	defer c.muRemove.Unlock()
+
+	// The cache may have closed while we waited.
+	if c.isClosed.Load() {
+		return
+	}
+
+	c.getRemPieces()
+}
