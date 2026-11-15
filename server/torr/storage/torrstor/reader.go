@@ -206,9 +206,15 @@ func (r *Reader) getOffsetRange() (int64, int64) {
 }
 
 func (r *Reader) checkReader() {
+	if r.cache != nil {
+		r.cache.evictionMu.RLock()
+		defer r.cache.evictionMu.RUnlock()
+	}
+
 	s := r.stateSnapshot()
 
-	if time.Now().Unix() > s.lastAccess+60 && r.cache.Readers() > 1 {
+	if time.Now().Unix() > s.lastAccess+60 &&
+		r.cache.Readers() > 1 {
 		r.readerOff()
 	} else {
 		r.readerOn()
@@ -218,6 +224,11 @@ func (r *Reader) checkReader() {
 // beginIO claims the reader for one read or seek and resumes it if the sweep parked it.
 // Registering under mu is what keeps readerOff from parking it until endIO.
 func (r *Reader) beginIO() bool {
+	if r.cache != nil {
+		r.cache.evictionMu.RLock()
+		defer r.cache.evictionMu.RUnlock()
+	}
+
 	r.mu.Lock()
 	defer r.mu.Unlock()
 

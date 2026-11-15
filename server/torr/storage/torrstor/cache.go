@@ -125,6 +125,11 @@ type Cache struct {
 	lastFull     time.Time
 	lastPrio     atomic.Int64
 	statFilled   atomic.Int64
+	// evictionMu coordinates reader position changes with cache eviction.
+	//
+	// Readers acquire RLock when starting an operation.
+	// Eviction acquires Lock across window selection and discard.
+	evictionMu sync.RWMutex
 }
 
 func NewCache(capacity int64, storage *Storage) *Cache {
@@ -683,4 +688,13 @@ func (c *Cache) GetCapacity() int64 {
 		return 0
 	}
 	return c.capacity
+}
+
+func (c *Cache) withStableReaderWindows(
+	fn func([]byteInterval) error,
+) error {
+	c.evictionMu.Lock()
+	defer c.evictionMu.Unlock()
+
+	return fn(c.protectedByteIntervals())
 }
