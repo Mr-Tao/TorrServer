@@ -64,13 +64,16 @@ func (cancelWaitPiece) Completion() storage.Completion {
 }
 
 func TestCloseReaderCancelsBlockedTorrentRead(t *testing.T) {
-	const pieceSize int64 = 16 << 10
+	const (
+		pieceSize int64 = 16 << 10
+		fileSize  int64 = 1 << 20
+	)
 
 	info := metainfo.Info{
 		Name:        "unavailable.bin",
-		Length:      64 << 10,
+		Length:      fileSize,
 		PieceLength: pieceSize,
-		Pieces:      make([]byte, 4*20),
+		Pieces:      make([]byte, int(fileSize/pieceSize)*20),
 	}
 
 	infoBytes, err := bencode.Marshal(info)
@@ -113,8 +116,9 @@ func TestCloseReaderCancelsBlockedTorrentRead(t *testing.T) {
 
 	// This cache manages the wrapper reader only.
 	// The torrent itself uses the empty test storage.
-	c := NewCache(32<<20, nil)
+	c := NewCache(128<<10, nil)
 	c.pieceLength = pieceSize
+	c.readerReadAheadPercent = 95
 
 	r := c.NewReader(files[0])
 	defer c.CloseReader(r)
@@ -163,6 +167,64 @@ waitForRead:
 
 	case <-time.After(50 * time.Millisecond):
 	}
+
+	// Verify that a real blocked Read() protects only its
+	// registered byte range, not the entire file.
+	state, ranges, unknown := r.stateWithReadsSnapshot()
+
+	if state.inFlight != 1 {
+		t.Fatalf("inFlight = %d, want 1", state.inFlight)
+	}
+
+	if unknown {
+		t.Fatal("ordinary blocked Read protects the entire file")
+	}
+
+	wantRange := byteInterval{
+		begin: files[0].Offset(),
+		end:   files[0].Offset() + 1024,
+	}
+
+	if len(ranges) != 1 || ranges[0] != wantRange {
+		t.Fatalf(
+			"in-flight ranges = %v, want [%v]",
+			ranges, wantRange,
+		)
+	}
+
+	// The reader is blocked in the first 256 KiB segment.
+	// A distant segment at offset 512 KiB must remain
+	// eligible for eviction.
+	farOffset := 2 * memSegmentSize
+
+	var candidates []int64
+
+	err = c.withStableReaderWindows(
+		func(protected []byteInterval) error {
+			candidates = selectEvictableRAMSegments(
+				0,
+				fileSize,
+				memSegmentSize,
+				[]int64{0, farOffset},
+				protected,
+			)
+			return nil
+		},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if len(candidates) != 1 || candidates[0] != farOffset {
+		t.Fatalf(
+			"evictable segments = %v, want [%d]",
+			candidates, farOffset,
+		)
+	}
+
+	// This synthetic cache has no torrent storage of its own.
+	// Suppress background priority maintenance during teardown.
+	c.isClosed.Store(true)
 
 	// This must cancel the underlying ReadContext().
 	c.CloseReader(r)
