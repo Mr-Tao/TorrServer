@@ -1,7 +1,5 @@
 package torrstor
 
-import "server/settings"
-
 // readerWindowSnapshot contains immutable information needed
 // to calculate the reader's protected range.
 type readerWindowSnapshot struct {
@@ -153,10 +151,7 @@ func (c *Cache) protectedByteIntervals() []byteInterval {
 
 	}
 
-	percent := int64(95)
-	if settings.BTsets != nil {
-		percent = int64(settings.BTsets.ReaderReadAHead)
-	}
+	percent := c.readerReadAheadPercent
 
 	return protectedIntervalsFromSnapshots(
 		windows,

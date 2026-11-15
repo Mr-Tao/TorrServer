@@ -130,20 +130,32 @@ type Cache struct {
 	// Readers acquire RLock when starting an operation.
 	// Eviction acquires Lock across window selection and discard.
 	evictionMu sync.RWMutex
-	// Immutable configuration captured when the cache is created.
-	patchEnabled bool
+	// Configuration captured at cache creation.
+	patchEnabled           bool
+	connectionsLimit       int
+	readerReadAheadPercent int64
 }
 
 func NewCache(capacity int64, storage *Storage) *Cache {
+	connectionsLimit := 0
+	readerReadAheadPercent := int64(95)
+
+	if bt := settings.BTsets; bt != nil {
+		connectionsLimit = bt.ConnectionsLimit
+		readerReadAheadPercent = int64(bt.ReaderReadAHead)
+	}
+
 	ret := &Cache{
-		capacity:     capacity,
-		filled:       0,
-		pieces:       make(map[int]*Piece),
-		storage:      storage,
-		readers:      make(map[*Reader]struct{}),
-		active:       make(map[int]*Piece),
-		prioSet:      make(map[int]struct{}),
-		patchEnabled: patchOn,
+		capacity:               capacity,
+		filled:                 0,
+		pieces:                 make(map[int]*Piece),
+		storage:                storage,
+		readers:                make(map[*Reader]struct{}),
+		active:                 make(map[int]*Piece),
+		prioSet:                make(map[int]struct{}),
+		patchEnabled:           patchOn,
+		connectionsLimit:       connectionsLimit,
+		readerReadAheadPercent: readerReadAheadPercent,
 	}
 
 	return ret
@@ -540,7 +552,7 @@ func (c *Cache) setLoadPriority(ranges []Range) {
 		readerPos := r.getReaderPiece()
 		readerRAHPos := r.getReaderRAHPiece()
 		end := r.getPiecesRange().End
-		count := settings.BTsets.ConnectionsLimit / len(readers) // max concurrent loading blocks
+		count := c.connectionsLimit / len(readers) // max concurrent loading blocks
 		if c.patchEnabled && inflightLimit > 0 {
 			count = inflightLimit / len(readers)
 		}

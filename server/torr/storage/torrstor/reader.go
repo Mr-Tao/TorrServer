@@ -9,7 +9,6 @@ import (
 	"github.com/anacrolix/torrent"
 
 	"server/log"
-	"server/settings"
 )
 
 type Reader struct {
@@ -213,7 +212,7 @@ func (r *Reader) getPieceNum(offset int64) int {
 
 func (r *Reader) getOffsetRange() (int64, int64) {
 	offset := r.Offset()
-	prc := int64(settings.BTsets.ReaderReadAHead)
+	prc := r.cache.readerReadAheadPercent
 	readers := int64(r.getUseReaders())
 	if readers == 0 {
 		readers = 1
