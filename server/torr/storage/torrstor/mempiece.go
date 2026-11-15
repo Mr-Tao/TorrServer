@@ -3,6 +3,7 @@ package torrstor
 import (
 	"fmt"
 	"io"
+	"sort"
 	"sync"
 )
 
@@ -170,17 +171,18 @@ type discardRangeFunc func(
 // This method does not decide whether the segment is safe to
 // evict from the perspective of active HTTP readers.
 func (p *MemPiece) DiscardSegment(offset int64) (int, error) {
-	if p == nil || p.piece == nil ||
-		p.piece.cache == nil ||
-		p.piece.cache.torrent == nil {
+	if p == nil || p.piece == nil || p.piece.cache == nil {
+		return 0, fmt.Errorf("torrstor: invalid memory piece")
+	}
+
+	torr := p.piece.cache.getTorrent()
+	if torr == nil {
 		return 0, fmt.Errorf("torrstor: torrent not available")
 	}
 
-	tp := p.piece.cache.torrent.Piece(p.piece.Id)
-
 	return p.discardSegmentWith(
 		offset,
-		tp.DiscardChunkRange,
+		torr.Piece(p.piece.Id).DiscardChunkRange,
 	)
 }
 
@@ -231,4 +233,43 @@ func (p *MemPiece) discardSegmentWith(
 
 		return nil
 	})
+}
+
+// allocatedSegmentOffsets returns a stable snapshot of
+// allocated segment offsets, relative to the piece.
+//
+// The returned slice is independent of the segments map.
+func (p *MemPiece) allocatedSegmentOffsets() []int64 {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+
+	offsets := make([]int64, 0, len(p.segments))
+
+	for off := range p.segments {
+		offsets = append(offsets, off)
+	}
+
+	sort.Slice(offsets, func(i, j int) bool {
+		return offsets[i] < offsets[j]
+	})
+
+	return offsets
+}
+
+// evictableSegmentOffsets returns allocated segments outside
+// all protected byte intervals.
+//
+// This is a snapshot-based advisory selection.
+// It does not modify the cache or torrent state.
+func (p *MemPiece) evictableSegmentOffsets(
+	pieceStart, pieceLength, segmentSize int64,
+	protected []byteInterval,
+) []int64 {
+	return selectEvictableRAMSegments(
+		pieceStart,
+		pieceLength,
+		segmentSize,
+		p.allocatedSegmentOffsets(),
+		protected,
+	)
 }

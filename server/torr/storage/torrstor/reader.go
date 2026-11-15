@@ -29,6 +29,29 @@ type Reader struct {
 	mu         sync.Mutex
 }
 
+type readerState struct {
+	offset     int64
+	readahead  int64
+	lastAccess int64
+	active     bool
+	closed     bool
+	inFlight   int
+}
+
+func (r *Reader) stateSnapshot() readerState {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	return readerState{
+		offset:     r.offset,
+		readahead:  r.readahead,
+		lastAccess: r.lastAccess,
+		active:     r.isUse,
+		closed:     r.isClosed,
+		inFlight:   r.inFlight,
+	}
+}
+
 func newReader(file *torrent.File, cache *Cache) *Reader {
 	r := new(Reader)
 	r.file = file
@@ -44,31 +67,30 @@ func newReader(file *torrent.File, cache *Cache) *Reader {
 	return r
 }
 
-func (r *Reader) Seek(offset int64, whence int) (n int64, err error) {
-	if r.isClosed {
+func (r *Reader) Seek(offset int64, whence int) (int64, error) {
+	if !r.beginIO() {
 		return 0, io.EOF
 	}
-	switch whence {
-	case io.SeekStart:
-		r.offset = offset
-	case io.SeekCurrent:
-		r.offset += offset
-	case io.SeekEnd:
-		r.offset = r.file.Length() + offset
-	}
-	r.beginIO()
 	defer r.endIO()
-	n, err = r.Reader.Seek(offset, whence)
-	r.offset = n
-	r.lastAccess = time.Now().Unix()
-	return
+
+	n, err := r.Reader.Seek(offset, whence)
+
+	r.mu.Lock()
+	if err == nil {
+		r.offset = n
+		r.lastAccess = time.Now().Unix()
+	}
+	r.mu.Unlock()
+
+	return n, err
 }
 
 func (r *Reader) Read(p []byte) (n int, err error) {
 	err = io.EOF
-	if r.isClosed {
-		return
+	if !r.beginIO() {
+		return 0, io.EOF
 	}
+	defer r.endIO()
 	if r.file.Torrent() != nil && r.file.Torrent().Info() != nil {
 		r.beginIO()
 		defer r.endIO()
@@ -91,9 +113,10 @@ func (r *Reader) Read(p []byte) (n int, err error) {
 		//		p[191] = 0x56 // V
 		//	}
 		//}
-
+		r.mu.Lock()
 		r.offset += int64(n)
 		r.lastAccess = time.Now().Unix()
+		r.mu.Unlock()
 	} else {
 		log.TLogln("Torrent closed and readed")
 	}
@@ -101,27 +124,37 @@ func (r *Reader) Read(p []byte) (n int, err error) {
 }
 
 func (r *Reader) SetReadahead(length int64) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
 	if r.cache != nil && length > r.cache.capacity {
 		length = r.cache.capacity
 	}
+
+	r.readahead = length
 	if r.isUse {
 		r.Reader.SetReadahead(length)
 	}
-	r.readahead = length
 }
 
 func (r *Reader) Offset() int64 {
-	return r.offset
+	return r.stateSnapshot().offset
 }
 
 func (r *Reader) Readahead() int64 {
-	return r.readahead
+	return r.stateSnapshot().readahead
 }
 
 func (r *Reader) Close() {
 	// file reader close in gotorrent
 	// this struct close in cache
+	r.mu.Lock()
+	if r.isClosed {
+		r.mu.Unlock()
+		return
+	}
 	r.isClosed = true
+	r.mu.Unlock()
 	if len(r.file.Torrent().Files()) > 0 {
 		r.Reader.Close()
 	}
@@ -138,11 +171,13 @@ func (r *Reader) getPiecesRange() Range {
 }
 
 func (r *Reader) getReaderPiece() int {
-	return r.getPieceNum(r.offset)
+	offset := r.Offset()
+	return r.getPieceNum(offset)
 }
 
 func (r *Reader) getReaderRAHPiece() int {
-	return r.getPieceNum(r.offset + r.readahead)
+	s := r.stateSnapshot()
+	return r.getPieceNum(s.offset + s.readahead)
 }
 
 func (r *Reader) getPieceNum(offset int64) int {
@@ -150,14 +185,15 @@ func (r *Reader) getPieceNum(offset int64) int {
 }
 
 func (r *Reader) getOffsetRange() (int64, int64) {
+	offset := r.Offset()
 	prc := int64(settings.BTsets.ReaderReadAHead)
 	readers := int64(r.getUseReaders())
 	if readers == 0 {
 		readers = 1
 	}
 
-	beginOffset := r.offset - (r.cache.capacity/readers)*(100-prc)/100
-	endOffset := r.offset + (r.cache.capacity/readers)*prc/100
+	beginOffset := offset - (r.cache.capacity/readers)*(100-prc)/100
+	endOffset := offset + (r.cache.capacity/readers)*prc/100
 
 	if beginOffset < 0 {
 		beginOffset = 0
@@ -170,7 +206,9 @@ func (r *Reader) getOffsetRange() (int64, int64) {
 }
 
 func (r *Reader) checkReader() {
-	if time.Now().Unix() > r.lastAccess+60 && r.cache.Readers() > 1 {
+	s := r.stateSnapshot()
+
+	if time.Now().Unix() > s.lastAccess+60 && r.cache.Readers() > 1 {
 		r.readerOff()
 	} else {
 		r.readerOn()
@@ -179,11 +217,17 @@ func (r *Reader) checkReader() {
 
 // beginIO claims the reader for one read or seek and resumes it if the sweep parked it.
 // Registering under mu is what keeps readerOff from parking it until endIO.
-func (r *Reader) beginIO() {
+func (r *Reader) beginIO() bool {
 	r.mu.Lock()
 	defer r.mu.Unlock()
+
+	if r.isClosed {
+		return false
+	}
+
 	r.inFlight++
 	r.resume()
+	return true
 }
 
 func (r *Reader) endIO() {
@@ -204,7 +248,7 @@ func (r *Reader) resume() {
 		if pos, err := r.Reader.Seek(0, io.SeekCurrent); err == nil && pos == 0 {
 			r.Reader.Seek(r.offset, io.SeekStart)
 		}
-		r.SetReadahead(r.readahead)
+		r.Reader.SetReadahead(r.readahead)
 		r.isUse = true
 	}
 }
@@ -218,7 +262,7 @@ func (r *Reader) readerOff() {
 		return
 	}
 	if r.isUse {
-		r.SetReadahead(0)
+		r.Reader.SetReadahead(0)
 		r.isUse = false
 		if r.offset > 0 {
 			r.Reader.Seek(0, io.SeekStart)

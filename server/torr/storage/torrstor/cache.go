@@ -116,7 +116,7 @@ type Cache struct {
 	// reset of a reader that has just closed cannot wipe the priorities a
 	// freshly created reader has already set.
 	muPrio  sync.Mutex
-	torrent *torrent.Torrent
+	torrent atomic.Pointer[torrent.Torrent]
 
 	muActive     sync.Mutex
 	active       map[int]*Piece
@@ -184,7 +184,7 @@ func (c *Cache) priorityWatchdog() {
 		if c.isClosed.Load() {
 			return
 		}
-		if c.torrent == nil {
+		if c.getTorrent() == nil {
 			continue
 		}
 		if c.GetUseReaders() > 0 {
@@ -201,11 +201,18 @@ func (c *Cache) priorityWatchdog() {
 	}
 }
 
+func (c *Cache) getTorrent() *torrent.Torrent {
+	if c == nil {
+		return nil
+	}
+	return c.torrent.Load()
+}
+
 func (c *Cache) SetTorrent(torr *torrent.Torrent) {
 	if c == nil {
 		return
 	}
-	c.torrent = torr
+	c.torrent.Store(torr)
 }
 
 func (c *Cache) getPieces() map[int]*Piece {
@@ -232,8 +239,8 @@ func (c *Cache) Piece(m metainfo.Piece) storage.PieceImpl {
 }
 
 func (c *Cache) Close() error {
-	if c.torrent != nil {
-		log.TLogln("Close cache for:", c.torrent.Name(), c.hash)
+	if torr := c.getTorrent(); torr != nil {
+		log.TLogln("Close cache for:", torr.Name(), c.hash)
 	} else {
 		log.TLogln("Close cache for:", c.hash)
 	}
@@ -294,16 +301,27 @@ func (c *Cache) GetState() *state.CacheState {
 	if patchOn && settings.BTsets != nil && c.active != nil {
 		scan = c.activeSnapshot()
 	}
+
+	torr := c.getTorrent()
+
 	for _, p := range scan {
-		if p.Size > 0 {
-			fill += p.Size
-			piecesState[p.Id] = state.ItemState{
-				Id:        p.Id,
-				Size:      p.Size,
-				Length:    c.pieceLength,
-				Completed: p.Complete,
-				Priority:  int(c.torrent.PieceState(p.Id).Priority),
-			}
+		m := p.meta()
+		if m.size <= 0 {
+			continue
+		}
+
+		priority := torrent.PiecePriorityNone
+		if torr != nil {
+			priority = torr.PieceState(p.Id).Priority
+		}
+
+		fill += m.size
+		piecesState[p.Id] = state.ItemState{
+			Id:        p.Id,
+			Size:      m.size,
+			Length:    c.pieceLength,
+			Completed: m.complete,
+			Priority:  int(priority),
 		}
 	}
 
@@ -419,7 +437,7 @@ func (c *Cache) getRemPiecesX(applyPrio, full bool) []*Piece {
 	ranges := make([]Range, 0)
 	for _, r := range readers {
 		r.checkReader()
-		if r.isUse {
+		if r.stateSnapshot().active {
 			ranges = append(ranges, r.getPiecesRange())
 		}
 	}
@@ -481,6 +499,10 @@ func (c *Cache) getRemPiecesX(applyPrio, full bool) []*Piece {
 }
 
 func (c *Cache) setLoadPriority(ranges []Range) {
+	torr := c.getTorrent()
+	if torr == nil {
+		return
+	}
 	readers := c.readersSnapshot()
 	pieces := c.getPieces()
 	if len(readers) == 0 || pieces == nil {
@@ -489,7 +511,7 @@ func (c *Cache) setLoadPriority(ranges []Range) {
 	c.muPrio.Lock()
 	defer c.muPrio.Unlock()
 	for _, r := range readers {
-		if !r.isUse {
+		if !r.stateSnapshot().active {
 			continue
 		}
 		if c.isIdInFileBE(ranges, r.getReaderPiece()) {
@@ -507,15 +529,15 @@ func (c *Cache) setLoadPriority(ranges []Range) {
 			if !pieces[i].Complete {
 				c.prioSet[i] = struct{}{}
 				if i == readerPos {
-					c.torrent.Piece(i).SetPriority(torrent.PiecePriorityNow)
+					torr.Piece(i).SetPriority(torrent.PiecePriorityNow)
 				} else if i == readerPos+1 {
-					c.torrent.Piece(i).SetPriority(torrent.PiecePriorityNext)
+					torr.Piece(i).SetPriority(torrent.PiecePriorityNext)
 				} else if i > readerPos && i <= readerRAHPos {
-					c.torrent.Piece(i).SetPriority(torrent.PiecePriorityReadahead)
-				} else if i > readerRAHPos && i <= readerRAHPos+5 && c.torrent.PieceState(i).Priority != torrent.PiecePriorityHigh {
-					c.torrent.Piece(i).SetPriority(torrent.PiecePriorityHigh)
-				} else if i > readerRAHPos+5 && c.torrent.PieceState(i).Priority != torrent.PiecePriorityNormal {
-					c.torrent.Piece(i).SetPriority(torrent.PiecePriorityNormal)
+					torr.Piece(i).SetPriority(torrent.PiecePriorityReadahead)
+				} else if i > readerRAHPos && i <= readerRAHPos+5 && torr.PieceState(i).Priority != torrent.PiecePriorityHigh {
+					torr.Piece(i).SetPriority(torrent.PiecePriorityHigh)
+				} else if i > readerRAHPos+5 && torr.PieceState(i).Priority != torrent.PiecePriorityNormal {
+					torr.Piece(i).SetPriority(torrent.PiecePriorityNormal)
 				}
 				limit++
 			}
@@ -553,18 +575,13 @@ func (c *Cache) NewReader(file *torrent.File) *Reader {
 }
 
 func (c *Cache) GetUseReaders() int {
-	if c == nil {
-		return 0
-	}
-	c.muReaders.RLock()
-	defer c.muReaders.RUnlock()
-	readers := 0
-	for reader := range c.readers {
-		if reader.isUse {
-			readers++
+	count := 0
+	for _, r := range c.readersSnapshot() {
+		if r.stateSnapshot().active {
+			count++
 		}
 	}
-	return readers
+	return count
 }
 
 func (c *Cache) Readers() int {
@@ -592,7 +609,8 @@ func (c *Cache) clearPriorityX(full bool) {
 		c.clearPriority()
 		return
 	}
-	if c.torrent == nil {
+	torr := c.getTorrent()
+	if torr == nil {
 		return
 	}
 	t0 := time.Now()
@@ -603,7 +621,7 @@ func (c *Cache) clearPriorityX(full bool) {
 	ranges := make([]Range, 0)
 	for _, r := range c.readersSnapshot() {
 		r.checkReader()
-		if r.isUse {
+		if r.stateSnapshot().active {
 			ranges = append(ranges, r.getPiecesRange())
 		}
 	}
@@ -611,8 +629,8 @@ func (c *Cache) clearPriorityX(full bool) {
 	for id := range c.prioSet {
 		if len(ranges) == 0 || !inRanges(ranges, id) {
 			stats.pieceStateCalls.Add(1)
-			if c.torrent.PieceState(id).Priority != torrent.PiecePriorityNone {
-				c.torrent.Piece(id).SetPriority(torrent.PiecePriorityNone)
+			if torr.PieceState(id).Priority != torrent.PiecePriorityNone {
+				torr.Piece(id).SetPriority(torrent.PiecePriorityNone)
 			}
 			delete(c.prioSet, id)
 		}
@@ -620,7 +638,8 @@ func (c *Cache) clearPriorityX(full bool) {
 }
 
 func (c *Cache) clearPriority() {
-	if c.torrent == nil {
+	torr := c.getTorrent()
+	if torr == nil {
 		return
 	}
 	t0 := time.Now()
@@ -636,7 +655,7 @@ func (c *Cache) clearPriority() {
 	ranges := make([]Range, 0)
 	for _, r := range c.readersSnapshot() {
 		r.checkReader()
-		if r.isUse {
+		if r.stateSnapshot().active {
 			ranges = append(ranges, r.getPiecesRange())
 		}
 	}
@@ -646,14 +665,14 @@ func (c *Cache) clearPriority() {
 		if len(ranges) > 0 {
 			if !inRanges(ranges, id) {
 				stats.pieceStateCalls.Add(1)
-				if c.torrent.PieceState(id).Priority != torrent.PiecePriorityNone {
-					c.torrent.Piece(id).SetPriority(torrent.PiecePriorityNone)
+				if torr.PieceState(id).Priority != torrent.PiecePriorityNone {
+					torr.Piece(id).SetPriority(torrent.PiecePriorityNone)
 				}
 			}
 		} else {
 			stats.pieceStateCalls.Add(1)
-			if c.torrent.PieceState(id).Priority != torrent.PiecePriorityNone {
-				c.torrent.Piece(id).SetPriority(torrent.PiecePriorityNone)
+			if torr.PieceState(id).Priority != torrent.PiecePriorityNone {
+				torr.Piece(id).SetPriority(torrent.PiecePriorityNone)
 			}
 		}
 	}

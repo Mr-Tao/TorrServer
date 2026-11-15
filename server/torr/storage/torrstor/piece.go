@@ -145,11 +145,11 @@ func (p *Piece) Completion() storage.Completion {
 
 func (p *Piece) Release() error {
 	if p.mPiece != nil {
-		if p.cache == nil || p.cache.torrent == nil {
+		if p.cache == nil || p.cache.getTorrent() == nil {
 			return errors.New("torrstor: torrent not available")
 		}
 
-		tp := p.cache.torrent.Piece(p.Id)
+		tp := p.cache.getTorrent().Piece(p.Id)
 
 		return tp.DiscardAllChunks(func() error {
 			p.mPiece.Release()
@@ -159,8 +159,9 @@ func (p *Piece) Release() error {
 
 	// Preserve the original disk-cache behavior.
 	p.dPiece.Release()
-	p.cache.torrent.Piece(p.Id).SetPriority(torrent.PiecePriorityNone)
-	p.cache.torrent.Piece(p.Id).UpdateCompletion()
+	torr := p.cache.getTorrent()
+	torr.Piece(p.Id).SetPriority(torrent.PiecePriorityNone)
+	torr.Piece(p.Id).UpdateCompletion()
 
 	return nil
 }
