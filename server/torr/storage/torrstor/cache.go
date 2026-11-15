@@ -599,13 +599,8 @@ func (c *Cache) Readers() int {
 }
 
 func (c *Cache) CloseReader(r *Reader) {
-	r.cache.muReaders.Lock()
-	delete(r.cache.readers, r)
-	r.cache.muReaders.Unlock()
-	// Reader.Close touches anacrolix internals, keep it outside muReaders
-	r.Close()
-	if !patchOn {
-		go c.clearPriority()
+	if r != nil {
+		r.Close()
 	}
 }
 
@@ -697,4 +692,16 @@ func (c *Cache) withStableReaderWindows(
 	defer c.evictionMu.Unlock()
 
 	return fn(c.protectedByteIntervals())
+}
+
+// registerReader makes registration atomic with respect to eviction.
+// A newly returned Reader must be visible in the cache's reader map.
+func (c *Cache) registerReader(r *Reader) {
+	c.evictionMu.RLock()
+	defer c.evictionMu.RUnlock()
+
+	c.muReaders.Lock()
+	defer c.muReaders.Unlock()
+
+	c.readers[r] = struct{}{}
 }

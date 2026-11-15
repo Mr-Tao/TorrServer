@@ -8,6 +8,12 @@ type readerWindowSnapshot struct {
 	state      readerState
 	fileStart  int64 // Absolute torrent offset
 	fileLength int64
+	// Byte ranges of individual reads currently in progress.
+	// Intervals use absolute torrent offsets, not file-relative offsets.
+	inFlightReads []byteInterval
+	// An overlapping Seek or another operation made the
+	// recorded read ranges unreliable.
+	unknownInFlight bool
 }
 
 func readerParticipates(s readerState) bool {
@@ -51,14 +57,27 @@ func protectedIntervalsFromSnapshots(
 
 		fileEnd := r.fileStart + r.fileLength
 
-		// During an in-flight read or seek, the published
-		// position may be stale. Protect the entire file.
-		if r.state.inFlight > 0 || capacity <= 0 {
+		// If the cache window has no capacity, protect the entire file.
+		if capacity <= 0 {
 			protected = append(protected, byteInterval{
 				begin: r.fileStart,
 				end:   fileEnd,
 			})
 			continue
+		}
+
+		// Protect the exact ranges of in-flight reads.
+		// If their ranges are unknown, protect the entire file.
+		if r.state.inFlight > 0 {
+			protected = append(protected, readerInFlightIntervals(r)...)
+
+			// When an operation has no reliable byte range,
+			// the entire file is already protected.
+			// No additional playback window is necessary.
+			if r.unknownInFlight ||
+				len(r.inFlightReads) != r.state.inFlight {
+				continue
+			}
 		}
 
 		share := capacity / int64(active)
@@ -122,11 +141,16 @@ func (c *Cache) protectedByteIntervals() []byteInterval {
 			continue
 		}
 
+		state, ranges, unknown := r.stateWithReadsSnapshot()
+
 		windows = append(windows, readerWindowSnapshot{
-			state:      r.stateSnapshot(),
-			fileStart:  r.file.Offset(),
-			fileLength: r.file.Length(),
+			state:           state,
+			fileStart:       r.file.Offset(),
+			fileLength:      r.file.Length(),
+			inFlightReads:   ranges,
+			unknownInFlight: unknown,
 		})
+
 	}
 
 	percent := int64(95)
@@ -139,4 +163,27 @@ func (c *Cache) protectedByteIntervals() []byteInterval {
 		c.capacity,
 		percent,
 	)
+}
+
+// readerInFlightIntervals returns the byte ranges that must remain
+// allocated while operations on this reader are in progress.
+//
+// If any operation lacks a recorded range (including a Seek),
+// conservatively protect the entire file.
+func readerInFlightIntervals(r readerWindowSnapshot) []byteInterval {
+	if r.state.inFlight <= 0 {
+		return nil
+	}
+
+	if r.unknownInFlight ||
+		len(r.inFlightReads) != r.state.inFlight {
+		return []byteInterval{
+			{
+				begin: r.fileStart,
+				end:   r.fileStart + r.fileLength,
+			},
+		}
+	}
+
+	return r.inFlightReads
 }

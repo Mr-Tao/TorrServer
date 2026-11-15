@@ -1,6 +1,7 @@
 package torrstor
 
 import (
+	"context"
 	"io"
 	"sync"
 	"time"
@@ -27,6 +28,15 @@ type Reader struct {
 	lastAccess int64
 	isUse      bool
 	mu         sync.Mutex
+	// All fields are protected by mu.
+	activeReadRanges map[uint64]byteInterval
+	nextReadID       uint64
+	unknownInFlight  bool
+	// Protected by mu. Invalidates position updates from old reads.
+	posGeneration uint64
+	// Created once in newReader. Canceled when the reader closes.
+	readCtx     context.Context
+	cancelReads context.CancelFunc
 }
 
 type readerState struct {
@@ -42,6 +52,10 @@ func (r *Reader) stateSnapshot() readerState {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
+	return r.stateSnapshotLocked()
+}
+
+func (r *Reader) stateSnapshotLocked() readerState {
 	return readerState{
 		offset:     r.offset,
 		readahead:  r.readahead,
@@ -61,9 +75,9 @@ func newReader(file *torrent.File, cache *Cache) *Reader {
 	r.cache = cache
 	r.isUse = true
 
-	cache.muReaders.Lock()
-	cache.readers[r] = struct{}{}
-	cache.muReaders.Unlock()
+	r.readCtx, r.cancelReads = context.WithCancel(context.Background())
+
+	cache.registerReader(r)
 	return r
 }
 
@@ -73,28 +87,41 @@ func (r *Reader) Seek(offset int64, whence int) (int64, error) {
 	}
 	defer r.endIO()
 
-	n, err := r.Reader.Seek(offset, whence)
-
+	// Invalidate reads started before this Seek.
 	r.mu.Lock()
-	if err == nil {
-		r.offset = n
-		r.lastAccess = time.Now().Unix()
-	}
+	r.posGeneration++
 	r.mu.Unlock()
 
-	return n, err
+	// Do not hold r.mu while calling the underlying reader.
+	pos, err := r.Reader.Seek(offset, whence)
+
+	r.mu.Lock()
+
+	// Also invalidate reads that started while Seek
+	// was executing.
+	r.posGeneration++
+
+	if err == nil {
+		r.offset = pos
+	}
+
+	r.lastAccess = time.Now().Unix()
+	r.mu.Unlock()
+
+	return pos, err
 }
 
 func (r *Reader) Read(p []byte) (n int, err error) {
 	err = io.EOF
-	if !r.beginIO() {
+	readID, readGeneration, ok := r.beginRead(len(p))
+	if !ok {
 		return 0, io.EOF
 	}
-	defer r.endIO()
+	defer r.endRead(readID)
 	if r.file.Torrent() != nil && r.file.Torrent().Info() != nil {
 		r.beginIO()
 		defer r.endIO()
-		n, err = r.Reader.Read(p)
+		n, err = r.Reader.ReadContext(r.readCtx, p)
 
 		// samsung tv fix xvid/divx
 		//if r.offset == 0 && len(p) >= 192 {
@@ -113,10 +140,7 @@ func (r *Reader) Read(p []byte) (n int, err error) {
 		//		p[191] = 0x56 // V
 		//	}
 		//}
-		r.mu.Lock()
-		r.offset += int64(n)
-		r.lastAccess = time.Now().Unix()
-		r.mu.Unlock()
+		r.finishReadPosition(readGeneration, n)
 	} else {
 		log.TLogln("Torrent closed and readed")
 	}
@@ -146,22 +170,27 @@ func (r *Reader) Readahead() int64 {
 }
 
 func (r *Reader) Close() {
-	// file reader close in gotorrent
-	// this struct close in cache
 	r.mu.Lock()
+
 	if r.isClosed {
 		r.mu.Unlock()
 		return
 	}
+
 	r.isClosed = true
+	cancel := r.cancelReads
+	finish := r.inFlight == 0
+
 	r.mu.Unlock()
-	if len(r.file.Torrent().Files()) > 0 {
-		r.Reader.Close()
+
+	// Wake reads waiting for torrent data.
+	// Do not hold r.mu while canceling.
+	if cancel != nil {
+		cancel()
 	}
-	if patchOn {
-		go r.cache.getRemPiecesX(true, false)
-	} else {
-		go r.cache.getRemPieces()
+
+	if finish {
+		r.finalizeClose()
 	}
 }
 
@@ -236,6 +265,10 @@ func (r *Reader) beginIO() bool {
 		return false
 	}
 
+	if r.inFlight != 0 {
+		r.unknownInFlight = true
+	}
+
 	r.inFlight++
 	r.resume()
 	return true
@@ -243,8 +276,20 @@ func (r *Reader) beginIO() bool {
 
 func (r *Reader) endIO() {
 	r.mu.Lock()
+
 	r.inFlight--
+	last := r.inFlight == 0
+
+	if last {
+		r.unknownInFlight = false
+	}
+
+	finish := last && r.isClosed
 	r.mu.Unlock()
+
+	if finish {
+		r.finalizeClose()
+	}
 }
 
 func (r *Reader) readerOn() {
@@ -283,4 +328,142 @@ func (r *Reader) readerOff() {
 
 func (r *Reader) getUseReaders() int {
 	return r.cache.GetUseReaders()
+}
+
+// beginRead registers the requested byte range before I/O begins.
+func (r *Reader) beginRead(length int) (uint64, uint64, bool) {
+	if r.cache != nil {
+		r.cache.evictionMu.RLock()
+		defer r.cache.evictionMu.RUnlock()
+	}
+
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	if r.isClosed {
+		return 0, 0, false
+	}
+
+	// Concurrent operations may change the underlying reader
+	// position. Their ranges are not reliable.
+	if r.inFlight != 0 {
+		r.unknownInFlight = true
+	}
+
+	r.inFlight++
+	r.nextReadID++
+	id := r.nextReadID
+
+	fileLength := r.file.Length()
+
+	if length <= 0 || r.offset < 0 || r.offset >= fileLength {
+		r.unknownInFlight = true
+	} else {
+		size := int64(length)
+
+		if size > fileLength-r.offset {
+			size = fileLength - r.offset
+		}
+
+		start := r.file.Offset() + r.offset
+		end := start + size
+
+		if start < r.file.Offset() || end < start {
+			// Invalid or overflowing range.
+			r.unknownInFlight = true
+		} else {
+			if r.activeReadRanges == nil {
+				r.activeReadRanges = make(map[uint64]byteInterval)
+			}
+
+			r.activeReadRanges[id] = byteInterval{
+				begin: start,
+				end:   end,
+			}
+		}
+	}
+
+	r.resume()
+	return id, r.posGeneration, true
+}
+
+func (r *Reader) endRead(id uint64) {
+	r.mu.Lock()
+
+	delete(r.activeReadRanges, id)
+
+	r.inFlight--
+	last := r.inFlight == 0
+
+	if last {
+		r.unknownInFlight = false
+	}
+
+	finish := last && r.isClosed
+	r.mu.Unlock()
+
+	if finish {
+		r.finalizeClose()
+	}
+}
+
+// finishReadPosition updates the published position only
+// if no Seek has invalidated the read.
+func (r *Reader) finishReadPosition(generation uint64, n int) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	if r.posGeneration == generation {
+		r.offset += int64(n)
+	}
+
+	r.lastAccess = time.Now().Unix()
+}
+
+func (r *Reader) stateWithReadsSnapshot() (
+	readerState,
+	[]byteInterval,
+	bool,
+) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	state := r.stateSnapshotLocked()
+
+	ranges := make([]byteInterval, 0, len(r.activeReadRanges))
+	for _, interval := range r.activeReadRanges {
+		ranges = append(ranges, interval)
+	}
+
+	return state, ranges, r.unknownInFlight
+}
+
+// finalizeClose is called exactly once, after the last
+// in-flight operation has completed.
+func (r *Reader) finalizeClose() {
+	c := r.cache
+
+	if c != nil {
+		// Unregistration must not overlap an eviction snapshot.
+		c.evictionMu.RLock()
+
+		c.muReaders.Lock()
+		delete(c.readers, r)
+		c.muReaders.Unlock()
+
+		c.evictionMu.RUnlock()
+	}
+
+	// Do not close the underlying torrent reader while
+	// an operation is still using it.
+	if r.Reader != nil && r.file != nil {
+		if t := r.file.Torrent(); t != nil && len(t.Files()) > 0 {
+			_ = r.Reader.Close()
+		}
+	}
+
+	if c != nil {
+		go c.getRemPieces()
+		go c.clearPriority()
+	}
 }

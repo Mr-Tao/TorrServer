@@ -2,6 +2,7 @@ package torrstor
 
 import (
 	"reflect"
+	"slices"
 	"testing"
 )
 
@@ -119,6 +120,100 @@ func TestProtectedIntervalsFromSnapshots(t *testing.T) {
 			if !reflect.DeepEqual(got, tt.want) {
 				t.Fatalf(
 					"protected = %v, want %v",
+					got, tt.want,
+				)
+			}
+		})
+	}
+}
+
+func TestProtectedIntervalsInFlightReads(t *testing.T) {
+	const MiB int64 = 1 << 20
+	const segmentSize int64 = 256 << 10
+
+	// Four allocated segments in an 8 MiB piece.
+	allocated := []int64{
+		0,
+		2 * MiB,
+		4 * MiB,
+		6 * MiB,
+	}
+
+	tests := []struct {
+		name     string
+		inFlight int
+		reads    []byteInterval
+		want     []int64
+		unknown  bool
+	}{
+		{
+			name:     "one active read",
+			inFlight: 1,
+			reads: []byteInterval{
+				{4*MiB + 4096, 4*MiB + 8192},
+			},
+			want: []int64{0, 2 * MiB, 6 * MiB},
+		},
+		{
+			name:     "two active reads",
+			inFlight: 2,
+			reads: []byteInterval{
+				{2*MiB + 4096, 2*MiB + 8192},
+				{4*MiB + 4096, 4*MiB + 8192},
+			},
+			want: []int64{0, 6 * MiB},
+		},
+		{
+			name:     "untracked operation protects whole file",
+			inFlight: 1,
+			reads:    nil,
+			want:     nil,
+		},
+		{
+			name:     "seek invalidates recorded read range",
+			inFlight: 1,
+			reads: []byteInterval{
+				{4*MiB + 4096, 4*MiB + 8192},
+			},
+			unknown: true,
+			want:    nil,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			readers := []readerWindowSnapshot{
+				{
+					state: readerState{
+						offset:   16 * MiB,
+						inFlight: tt.inFlight,
+					},
+					fileStart:       0,
+					fileLength:      64 * MiB,
+					inFlightReads:   tt.reads,
+					unknownInFlight: tt.unknown,
+				},
+			}
+
+			// The ordinary playback window is around 16 MiB,
+			// outside the 8 MiB piece being examined.
+			protected := protectedIntervalsFromSnapshots(
+				readers,
+				1*MiB,
+				50,
+			)
+
+			got := selectEvictableRAMSegments(
+				0,
+				8*MiB,
+				segmentSize,
+				allocated,
+				protected,
+			)
+
+			if !slices.Equal(got, tt.want) {
+				t.Fatalf(
+					"evictable segments: got=%v want=%v",
 					got, tt.want,
 				)
 			}
