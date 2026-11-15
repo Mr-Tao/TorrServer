@@ -245,8 +245,8 @@ func (p *MemPiece) allocatedSegmentOffsets() []int64 {
 
 	offsets := make([]int64, 0, len(p.segments))
 
-	for off := range p.segments {
-		offsets = append(offsets, off)
+	for idx := range p.segments {
+		offsets = append(offsets, idx*memSegmentSize)
 	}
 
 	sort.Slice(offsets, func(i, j int) bool {

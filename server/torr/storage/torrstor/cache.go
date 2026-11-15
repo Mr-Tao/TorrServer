@@ -61,7 +61,7 @@ func (c *Cache) statsLoop() {
 		na := len(c.active)
 		c.muActive.Unlock()
 		log.TLogln(fmt.Sprintf("[CSTAT patch=%v] clean calls=%d skipped=%d runs=%d busy=%dms | getRem n=%d full=%d %dms scanned=%d | clearPrio n=%d full=%d %dms pstate=%d | gc n=%d %dms | removed=%d | active=%d filled=%dMB cap=%dMB readers=%d",
-			patchOn, cc, sk, cr, clms, gn, gf, gms, sc, cn, cf, cms, ps, gcn, gcms, rm, na, c.statFilled.Load()>>20, c.capacity>>20, len(c.readersSnapshot())))
+			c.patchEnabled, cc, sk, cr, clms, gn, gf, gms, sc, cn, cf, cms, ps, gcn, gcms, rm, na, c.statFilled.Load()>>20, c.capacity>>20, len(c.readersSnapshot())))
 	}
 }
 
@@ -130,17 +130,20 @@ type Cache struct {
 	// Readers acquire RLock when starting an operation.
 	// Eviction acquires Lock across window selection and discard.
 	evictionMu sync.RWMutex
+	// Immutable configuration captured when the cache is created.
+	patchEnabled bool
 }
 
 func NewCache(capacity int64, storage *Storage) *Cache {
 	ret := &Cache{
-		capacity: capacity,
-		filled:   0,
-		pieces:   make(map[int]*Piece),
-		storage:  storage,
-		readers:  make(map[*Reader]struct{}),
-		active:   make(map[int]*Piece),
-		prioSet:  make(map[int]struct{}),
+		capacity:     capacity,
+		filled:       0,
+		pieces:       make(map[int]*Piece),
+		storage:      storage,
+		readers:      make(map[*Reader]struct{}),
+		active:       make(map[int]*Piece),
+		prioSet:      make(map[int]struct{}),
+		patchEnabled: patchOn,
 	}
 
 	return ret
@@ -193,7 +196,7 @@ func (c *Cache) priorityWatchdog() {
 			continue
 		}
 		if c.GetUseReaders() > 0 {
-			if patchOn {
+			if c.patchEnabled {
 				full := time.Since(c.lastFull) > 60*time.Second
 				if full {
 					c.lastFull = time.Now()
@@ -303,7 +306,7 @@ func (c *Cache) GetState() *state.CacheState {
 	var fill int64 = 0
 
 	scan := c.getPieces()
-	if patchOn && settings.BTsets != nil && c.active != nil {
+	if c.patchEnabled && settings.BTsets != nil && c.active != nil {
 		scan = c.activeSnapshot()
 	}
 
@@ -357,7 +360,7 @@ func (c *Cache) cleanPieces() {
 		return
 	}
 	stats.cleanCalls.Add(1)
-	if patchOn {
+	if c.patchEnabled {
 		c.pendingClean.Store(true)
 	}
 
@@ -369,19 +372,31 @@ func (c *Cache) cleanPieces() {
 	c.isRemove.Store(true)
 	defer func() {
 		c.isRemove.Store(false)
+
+		// Decide while still holding muRemove.
+		rerun := c.patchEnabled &&
+			c.pendingClean.Load() &&
+			!c.isClosed.Load()
+
 		c.muRemove.Unlock()
-		if patchOn && c.pendingClean.Load() && !c.isClosed.Load() {
+
+		if rerun {
 			go c.cleanPieces()
 		}
 	}()
+	// The cache may have been closed between the initial
+	// isClosed check and acquiring muRemove.
+	if c.isClosed.Load() {
+		return
+	}
 
 	for iter := 0; iter < 4; iter++ {
-		if patchOn {
+		if c.patchEnabled {
 			c.pendingClean.Store(false)
 		}
 		t0 := time.Now()
 		apply := true
-		if patchOn {
+		if c.patchEnabled {
 			now := time.Now().UnixNano()
 			apply = now-c.lastPrio.Load() > 400e6 // priorities at most every 400 ms
 			if apply {
@@ -420,7 +435,7 @@ func (c *Cache) cleanPieces() {
 			}
 		}
 		stats.cleanNs.Add(int64(time.Since(t0)))
-		if !(patchOn && c.pendingClean.Load()) {
+		if !(c.patchEnabled && c.pendingClean.Load()) {
 			break
 		}
 	}
@@ -453,7 +468,7 @@ func (c *Cache) getRemPiecesX(applyPrio, full bool) []*Piece {
 
 	// Determine which chunks can be deleted
 	scan := c.getPieces()
-	if patchOn && settings.BTsets != nil && c.active != nil {
+	if c.patchEnabled && settings.BTsets != nil && c.active != nil {
 		scan = c.activeSnapshot()
 	}
 	stats.scanned.Add(int64(len(scan)))
@@ -477,7 +492,7 @@ func (c *Cache) getRemPiecesX(applyPrio, full bool) []*Piece {
 	}
 
 	if applyPrio {
-		if patchOn {
+		if c.patchEnabled {
 			c.clearPriorityX(full)
 		} else {
 			c.clearPriority()
@@ -526,7 +541,7 @@ func (c *Cache) setLoadPriority(ranges []Range) {
 		readerRAHPos := r.getReaderRAHPiece()
 		end := r.getPiecesRange().End
 		count := settings.BTsets.ConnectionsLimit / len(readers) // max concurrent loading blocks
-		if patchOn && inflightLimit > 0 {
+		if c.patchEnabled && inflightLimit > 0 {
 			count = inflightLimit / len(readers)
 		}
 		limit := 0

@@ -3,8 +3,8 @@ package torrstor
 import (
 	"bytes"
 	"io"
-	"testing"
 	"sync"
+	"testing"
 )
 
 func newSegmentTestPiece(length int64) *MemPiece {

@@ -49,6 +49,9 @@ func runStreamingRedownload(t *testing.T, wholePiece bool, completedPiece bool) 
 	// Configure an isolated RAM-cache test.
 	// Restore global settings after the test finishes.
 	previousSets := settings.BTsets
+	// Retain cache pointers even after Client.Close()
+	// removes them from their Storage instances.
+	var cachesToDrain []*Cache
 
 	settings.BTsets = &settings.BTSets{
 		UseDisk:          false,
@@ -59,6 +62,21 @@ func runStreamingRedownload(t *testing.T, wholePiece bool, completedPiece bool) 
 	}
 
 	t.Cleanup(func() {
+		// All deferred Client.Close() calls have finished
+		// before testing invokes this cleanup.
+		//
+		// Wait for any cleanup that was already running
+		// when the caches were closed.
+		for _, c := range cachesToDrain {
+			if c == nil {
+				continue
+			}
+
+			c.muRemove.Lock()
+			c.muRemove.Unlock()
+		}
+
+		// No cache cleanup may still be reading BTsets.
 		settings.BTsets = previousSets
 	})
 
@@ -110,10 +128,13 @@ func runStreamingRedownload(t *testing.T, wholePiece bool, completedPiece bool) 
 		t.Fatal(err)
 	}
 
-	seedCache := seedStor.GetCache(mi.HashInfoBytes())
+	seedCache := seedStor.GetCache(seedTorrent.InfoHash())
 	if seedCache == nil {
 		t.Fatal("seeder cache not initialized")
 	}
+
+	cachesToDrain = append(cachesToDrain, seedCache)
+
 	seedCache.SetTorrent(seedTorrent)
 
 	// Populate the complete piece before any peer connects.
@@ -158,9 +179,9 @@ func runStreamingRedownload(t *testing.T, wholePiece bool, completedPiece bool) 
 	}
 
 	// Leecher: our modified TorrServer RAM cache.
-	stor := NewStorage(16 << 20)
+	leechStor := NewStorage(16 << 20)
 	leechCfg := localTorrentConfig()
-	leechCfg.DefaultStorage = stor
+	leechCfg.DefaultStorage = leechStor
 	leechCfg.Seed = false
 
 	leecher, err := torrent.NewClient(leechCfg)
@@ -176,11 +197,14 @@ func runStreamingRedownload(t *testing.T, wholePiece bool, completedPiece bool) 
 		t.Fatal(err)
 	}
 
-	cache := stor.GetCache(mi.HashInfoBytes())
-	if cache == nil {
-		t.Fatal("TorrServer cache not initialized")
+	leechCache := leechStor.GetCache(leechTorrent.InfoHash())
+	if leechCache == nil {
+		t.Fatal("leecher cache not initialized")
 	}
-	cache.SetTorrent(leechTorrent)
+
+	cachesToDrain = append(cachesToDrain, leechCache)
+
+	leechCache.SetTorrent(leechTorrent)
 
 	leechTorrent.AddClientPeer(seeder)
 
@@ -218,7 +242,7 @@ func runStreamingRedownload(t *testing.T, wholePiece bool, completedPiece bool) 
 		deadline := time.Now().Add(3 * time.Second)
 
 		for {
-			err = cache.pieces[0].Release()
+			err = leechCache.pieces[0].Release()
 
 			if !errors.Is(err, torrent.ErrChunkDiscardBusy) {
 				break
@@ -235,7 +259,7 @@ func runStreamingRedownload(t *testing.T, wholePiece bool, completedPiece bool) 
 			t.Fatalf("whole-piece release: %v", err)
 		}
 
-		if allocated := cache.pieces[0].mPiece.allocated(); allocated != 0 {
+		if allocated := leechCache.pieces[0].mPiece.allocated(); allocated != 0 {
 			t.Fatalf("release retained %d bytes", allocated)
 		}
 
@@ -273,7 +297,7 @@ func runStreamingRedownload(t *testing.T, wholePiece bool, completedPiece bool) 
 	deadline := time.Now().Add(3 * time.Second)
 
 	for {
-		discarded, err = cache.pieces[0].mPiece.DiscardSegment(0)
+		discarded, err = leechCache.pieces[0].mPiece.DiscardSegment(0)
 		if !errors.Is(err, torrent.ErrChunkDiscardBusy) {
 			break
 		}

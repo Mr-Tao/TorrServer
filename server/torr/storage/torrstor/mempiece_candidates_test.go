@@ -12,9 +12,9 @@ func TestMemPieceEvictableSegmentOffsets(t *testing.T) {
 
 	mp := &MemPiece{
 		segments: map[int64][]byte{
-			0:               {1},
-			segmentSize:     {2},
-			3 * segmentSize: {3},
+			0: make([]byte, memSegmentSize),
+			1: make([]byte, memSegmentSize),
+			3: make([]byte, memSegmentSize),
 		},
 	}
 
@@ -32,7 +32,7 @@ func TestMemPieceEvictableSegmentOffsets(t *testing.T) {
 		protected,
 	)
 
-	want := []int64{0, 3 * segmentSize}
+	want := []int64{0, 3 * memSegmentSize}
 
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("candidates = %v, want %v", got, want)
