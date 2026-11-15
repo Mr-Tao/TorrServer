@@ -5,7 +5,6 @@ import (
 	"context"
 	"crypto/sha1"
 	"errors"
-	"fmt"
 	"io"
 	"testing"
 	"time"
@@ -35,24 +34,28 @@ func localTorrentConfig() *torrent.ClientConfig {
 }
 
 func TestStreamingSegmentRedownload(t *testing.T) {
-	runStreamingRedownload(t, false, false, false)
+	runStreamingRedownload(t, false, false, false, false)
 }
 
 func TestStreamingWholePieceRelease(t *testing.T) {
-	runStreamingRedownload(t, true, false, false)
+	runStreamingRedownload(t, true, false, false, false)
 }
 
 func TestStreamingCompletedPieceRelease(t *testing.T) {
-	runStreamingRedownload(t, false, true, false)
+	runStreamingRedownload(t, false, true, false, false)
 }
 
 func TestStreamingProtectedSegmentRedownload(t *testing.T) {
-	runStreamingRedownload(t, false, false, true)
+	runStreamingRedownload(t, false, false, true, false)
+}
+
+func TestStreamingAutomaticSegmentEviction(t *testing.T) {
+	runStreamingRedownload(t, false, false, true, true)
 }
 
 func runStreamingRedownload(
 	t *testing.T,
-	wholePiece, completedPiece, protectedEviction bool,
+	wholePiece, completedPiece, protectedEviction, automaticEviction bool,
 ) {
 	// Configure an isolated RAM-cache test.
 	// Restore global settings after the test finishes.
@@ -190,7 +193,7 @@ func runStreamingRedownload(
 	leechCapacity := int64(16 << 20)
 
 	if protectedEviction {
-		leechCapacity = 512 << 10
+		leechCapacity = 128 << 10
 	}
 
 	leechStor := NewStorage(leechCapacity)
@@ -220,11 +223,19 @@ func runStreamingRedownload(
 
 	leechCache.SetTorrent(leechTorrent)
 
+	preparationLockHeld := false
+
 	if protectedEviction {
-		// Prevent background cleanup from evicting our test
-		// segments before the explicit eviction operation.
+		// Keep downloaded segments in RAM until the test has
+		// established its protected reader.
 		leechCache.muRemove.Lock()
-		defer leechCache.muRemove.Unlock()
+		preparationLockHeld = true
+
+		defer func() {
+			if preparationLockHeld {
+				leechCache.muRemove.Unlock()
+			}
+		}()
 	}
 
 	leechTorrent.AddClientPeer(seeder)
@@ -365,51 +376,99 @@ func runStreamingRedownload(
 
 		missingBefore := leechTorrent.PieceBytesMissing(0)
 
-		// Selection and invalidation must use one stable
-		// snapshot under the exclusive eviction barrier.
-		deadline := time.Now().Add(3 * time.Second)
+		// cleanPieces normally calls getRemPiecesX before eviction.
+		// Reproduce that accounting step while holding muRemove.
+		leechCache.getRemPiecesX(false, false)
 
-		for {
-			err = leechCache.withStableReaderWindows(
-				func(protected []byteInterval) error {
-					candidates := m.evictableSegmentOffsets(
-						0,
-						pieceLength,
-						memSegmentSize,
-						protected,
-					)
-
-					if hasOffset(candidates, 0) {
-						return fmt.Errorf(
-							"active segment selected for eviction",
-						)
-					}
-
-					if !hasOffset(candidates, farOffset) {
-						return fmt.Errorf(
-							"far segment not evictable: %v",
-							candidates,
-						)
-					}
-
-					_, err := m.DiscardSegment(farOffset)
-					return err
-				},
+		filledBefore := leechCache.filled
+		if filledBefore <= leechCache.capacity {
+			t.Fatalf(
+				"test cache is not over capacity: filled=%d capacity=%d",
+				filledBefore, leechCache.capacity,
 			)
-
-			if !errors.Is(err, torrent.ErrChunkDiscardBusy) {
-				break
-			}
-
-			if time.Now().After(deadline) {
-				t.Fatal("protected eviction stayed busy")
-			}
-
-			time.Sleep(10 * time.Millisecond)
 		}
+		if automaticEviction {
+			// The direct torrent reader was last positioned at farOffset.
+			// Move it away so its readahead does not immediately request
+			// the segment we want to evict.
+			if _, err := reader.Seek(0, io.SeekStart); err != nil {
+				t.Fatal(err)
+			}
+			reader.SetReadahead(0)
 
-		if err != nil {
-			t.Fatalf("protected eviction: %v", err)
+			// Release the preparation lock. Any cleanup requested
+			// by MemPiece.WriteAt may now execute.
+			preparationLockHeld = false
+			leechCache.unlockMaintenance()
+
+			deadline := time.NewTimer(5 * time.Second)
+			defer deadline.Stop()
+
+			ticker := time.NewTicker(10 * time.Millisecond)
+			defer ticker.Stop()
+
+			for {
+				// Synchronize with cleanPieces and inspect the result.
+				leechCache.muRemove.Lock()
+				allocated = m.allocatedSegmentOffsets()
+				evicted := !hasOffset(allocated, farOffset)
+				leechCache.muRemove.Unlock()
+
+				if evicted {
+					break
+				}
+
+				select {
+				case <-ticker.C:
+				case <-deadline.C:
+					t.Fatalf(
+						"automatic eviction did not release segment %d; "+
+							"allocated=%v",
+						farOffset, allocated,
+					)
+				}
+			}
+		} else {
+			// Try eviction until the distant segment is removed.
+			// DiscardChunkRange can temporarily report ErrChunkDiscardBusy;
+			// evictRAMSegments deliberately skips such segments.
+			var totalFreed int64
+			deadline := time.Now().Add(3 * time.Second)
+
+			for {
+				freed, evictErr := leechCache.evictRAMSegments()
+				if evictErr != nil {
+					t.Fatalf("RAM segment eviction: %v", evictErr)
+				}
+				totalFreed += freed
+
+				if !hasOffset(m.allocatedSegmentOffsets(), farOffset) {
+					break
+				}
+
+				if time.Now().After(deadline) {
+					t.Fatalf(
+						"distant segment was not evicted: allocated=%v",
+						m.allocatedSegmentOffsets(),
+					)
+				}
+
+				time.Sleep(10 * time.Millisecond)
+			}
+
+			if totalFreed < memSegmentSize {
+				t.Fatalf(
+					"freed %d bytes, want at least %d",
+					totalFreed, memSegmentSize,
+				)
+			}
+
+			if want := filledBefore - totalFreed; leechCache.filled != want {
+				t.Fatalf(
+					"cache accounting: filled=%d, want=%d",
+					leechCache.filled, want,
+				)
+			}
 		}
 
 		allocated = m.allocatedSegmentOffsets()

@@ -1,6 +1,7 @@
 package torrstor
 
 import (
+	"errors"
 	"fmt"
 	"net/http"
 	_ "net/http/pprof"
@@ -27,6 +28,8 @@ func init() {
 		go func() { log.TLogln("pprof listening on", addr, http.ListenAndServe(addr, nil)) }()
 	}
 }
+
+const ramEvictionBatchBytes int64 = 2 << 20
 
 // ---- instrumentation / patch switch (TS_PATCH=1 enables the fast paths)
 var patchOn = os.Getenv("TS_PATCH") != "0"
@@ -420,9 +423,35 @@ func (c *Cache) cleanPieces() {
 		if c.filled > c.capacity {
 			released := false
 
+			// Segment-level eviction for the patched RAM cache.
+			if c.patchEnabled {
+				freed, err := c.evictRAMSegments()
+				if err != nil {
+					log.TLogln("RAM segment eviction:", err)
+				}
+
+				if freed > 0 {
+					released = true
+
+					// Continue reclaiming in another bounded pass,
+					// but only if this pass made progress.
+					if c.filled > c.capacity {
+						c.pendingClean.Store(true)
+					}
+				}
+			}
+
+			// Preserve legacy whole-piece eviction for disk storage
+			// and for the unpatched cache.
 			for _, p := range remPieces {
 				if c.filled <= c.capacity {
 					break
+				}
+
+				// Never discard an entire RAM piece through this
+				// fallback: it may contain protected segments.
+				if c.patchEnabled && p.mPiece != nil {
+					continue
 				}
 
 				before := p.memCost()
@@ -431,7 +460,6 @@ func (c *Cache) cleanPieces() {
 				}
 
 				if !c.removePiece(p) {
-					// A busy piece must not be counted as evicted.
 					continue
 				}
 
@@ -765,4 +793,82 @@ func (c *Cache) unlockMaintenance() {
 		!c.isClosed.Load() {
 		go c.cleanPieces()
 	}
+}
+
+// evictRAMSegments reclaims unprotected RAM segments until the
+// cache fits its capacity, or no eligible segments remain.
+//
+// Caller must hold muRemove.
+func (c *Cache) evictRAMSegments() (freed int64, err error) {
+	torr := c.getTorrent()
+	if torr == nil || torr.Info() == nil {
+		return 0, nil
+	}
+
+	err = c.withStableReaderWindows(func(protected []byteInterval) error {
+		active := c.activeSnapshot()
+
+		// Deterministic order for now. A later version can
+		// prioritize cold segments instead of piece indices.
+		ids := make([]int, 0, len(active))
+		for id, p := range active {
+			if p != nil && p.mPiece != nil {
+				ids = append(ids, id)
+			}
+		}
+		sort.Ints(ids)
+
+		for _, id := range ids {
+			if c.filled-freed <= c.capacity ||
+				freed >= ramEvictionBatchBytes {
+				break
+			}
+
+			p := active[id]
+			pieceLength := torr.Info().Piece(id).Length()
+			if pieceLength <= 0 {
+				continue
+			}
+
+			pieceStart := int64(id) * c.pieceLength
+
+			offsets := p.mPiece.evictableSegmentOffsets(
+				pieceStart,
+				pieceLength,
+				memSegmentSize,
+				protected,
+			)
+
+			for _, offset := range offsets {
+				if c.filled-freed <= c.capacity {
+					break
+				}
+
+				before := p.mPiece.allocated()
+
+				_, discardErr := p.mPiece.DiscardSegment(offset)
+				if errors.Is(discardErr, torrent.ErrChunkDiscardBusy) {
+					continue
+				}
+				if discardErr != nil {
+					return fmt.Errorf(
+						"evict piece %d segment %d: %w",
+						id, offset, discardErr,
+					)
+				}
+
+				after := p.mPiece.allocated()
+				if after < before {
+					freed += before - after
+				}
+			}
+		}
+
+		return nil
+	})
+
+	// Account for successfully discarded segments even if a
+	// later discard returned an error.
+	c.filled -= freed
+	return freed, err
 }

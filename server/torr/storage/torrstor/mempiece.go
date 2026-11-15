@@ -202,6 +202,10 @@ func (p *MemPiece) discardSegmentWith(
 
 	length := p.piece.cache.pieceLength
 
+	if torr := p.piece.cache.getTorrent(); torr != nil && torr.Info() != nil {
+		length = torr.Info().Piece(p.piece.Id).Length()
+	}
+
 	if offset < 0 ||
 		offset >= length ||
 		offset%memSegmentSize != 0 {
