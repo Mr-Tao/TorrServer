@@ -334,11 +334,6 @@ func TestStreamingLargePieceMemoryBound(t *testing.T) {
 			)
 
 			previousReceived = received
-
-			t.Logf(
-				"scheduler: %s",
-				leechTorrent.DebugStreamingAt(reader.Offset()),
-			)
 		}
 	}
 
