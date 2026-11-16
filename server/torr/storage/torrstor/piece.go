@@ -141,24 +141,32 @@ func (p *Piece) Completion() storage.Completion {
 }
 
 func (p *Piece) Release() error {
+	torr := p.cache.getTorrent()
+	if torr == nil {
+		return fmt.Errorf("torrstor: torrent not available")
+	}
+
+	tp := torr.Piece(p.Id)
+
 	if p.mPiece != nil {
-		if p.cache == nil || p.cache.getTorrent() == nil {
-			return errors.New("torrstor: torrent not available")
-		}
-
-		tp := p.cache.getTorrent().Piece(p.Id)
-
-		return tp.DiscardAllChunks(func() error {
+		// Atomically invalidate all torrent chunks and discard
+		// RAM storage under the torrent client's lock.
+		err := tp.DiscardAllChunks(func() error {
 			p.mPiece.Release()
 			return nil
 		})
+		if err != nil {
+			return err
+		}
+
+		// DiscardAllChunks already updates completion,
+		// chunk availability and reader notifications.
+	} else {
+		// Keep existing disk behavior for now.
+		p.dPiece.Release()
+		tp.UpdateCompletion()
 	}
 
-	// Preserve the original disk-cache behavior.
-	p.dPiece.Release()
-	torr := p.cache.getTorrent()
-	torr.Piece(p.Id).SetPriority(torrent.PiecePriorityNone)
-	torr.Piece(p.Id).UpdateCompletion()
-
+	tp.SetPriority(torrent.PiecePriorityNone)
 	return nil
 }
