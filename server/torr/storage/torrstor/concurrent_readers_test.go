@@ -18,6 +18,14 @@ import (
 )
 
 func TestStreamingConcurrentReaders(t *testing.T) {
+	runConcurrentReaderScenario(t, false)
+}
+
+func TestStreamingConcurrentSeek(t *testing.T) {
+	runConcurrentReaderScenario(t, true)
+}
+
+func runConcurrentReaderScenario(t *testing.T, seekScenario bool) {
 	const (
 		pieceLength int64 = 64 << 20
 		cacheSize   int64 = 32 << 20
@@ -29,6 +37,31 @@ func TestStreamingConcurrentReaders(t *testing.T) {
 	)
 
 	startOffsets := [2]int64{0, 32 << 20}
+
+	type readPhase struct {
+		offset int64
+		length int64
+	}
+
+	plans := [2][]readPhase{
+		{{offset: 0, length: readLength}},
+		{{offset: 32 << 20, length: readLength}},
+	}
+
+	if seekScenario {
+		plans[1] = []readPhase{
+			{offset: 32 << 20, length: 4 << 20},
+			{offset: 48 << 20, length: 8 << 20},
+			{offset: 32 << 20, length: 4 << 20},
+		}
+	}
+
+	var expectedBytes [2]int64
+	for id, phases := range plans {
+		for _, phase := range phases {
+			expectedBytes[id] += phase.length
+		}
+	}
 
 	oldSettings := settings.BTsets
 	settings.BTsets = &settings.BTSets{
@@ -43,8 +76,12 @@ func TestStreamingConcurrentReaders(t *testing.T) {
 	var seedCache, leechCache *Cache
 	var readers [2]*Reader
 	var workers sync.WaitGroup
+	stop := make(chan struct{})
+	aPaused := make(chan struct{})
+	resumeA := make(chan struct{})
 
 	t.Cleanup(func() {
+		close(stop)
 		// Stop networking before waiting for reader goroutines.
 		if leecher != nil {
 			leecher.Close()
@@ -200,56 +237,106 @@ func TestStreamingConcurrentReaders(t *testing.T) {
 			ready <- struct{}{}
 			<-start
 
-			begin := startOffsets[id]
 			buf := make([]byte, readSize)
 			var received int64
 			nextProgress := int64(1 << 20)
+			paused := false
 
 			finish := func(err error) {
 				done <- readResult{id, received, err}
 			}
 
-			for received < readLength {
-				want := int(min(
-					int64(len(buf)),
-					readLength-received,
-				))
+			for phaseIndex, phase := range plans[id] {
+				// Reader B waits for A to reach 8 MiB
+				// before performing the first seek.
+				if seekScenario && id == 1 && phaseIndex == 1 {
+					select {
+					case <-aPaused:
+					case <-stop:
+						finish(fmt.Errorf("reader B canceled"))
+						return
+					}
+				}
 
-				n, err := r.Read(buf[:want])
+				if _, err := r.Seek(phase.offset, io.SeekStart); err != nil {
+					finish(fmt.Errorf(
+						"reader %d: seek to %d: %w",
+						id, phase.offset, err,
+					))
+					return
+				}
 
-				if n > 0 {
-					offset := begin + received
-					expected := data[int(offset) : int(offset)+n]
+				// Resume reader A after the new position
+				// has been registered with the scheduler.
+				if seekScenario && id == 1 && phaseIndex == 1 {
+					close(resumeA)
+				}
 
-					if !bytes.Equal(buf[:n], expected) {
+				var phaseRead int64
+
+				for phaseRead < phase.length {
+					want := int(min(
+						int64(len(buf)),
+						phase.length-phaseRead,
+					))
+
+					n, err := r.Read(buf[:want])
+
+					if n > 0 {
+						offset := phase.offset + phaseRead
+						expected := data[int(offset) : int(offset)+n]
+
+						if !bytes.Equal(buf[:n], expected) {
+							finish(fmt.Errorf(
+								"reader %d phase %d: "+
+									"data mismatch at offset %d",
+								id, phaseIndex, offset,
+							))
+							return
+						}
+
+						phaseRead += int64(n)
+						received += int64(n)
+					}
+
+					if err != nil {
 						finish(fmt.Errorf(
-							"reader %d: data mismatch at %d",
-							id, offset,
+							"reader %d phase %d: "+
+								"read at %d: %w",
+							id, phaseIndex,
+							phase.offset+phaseRead, err,
 						))
 						return
 					}
 
-					received += int64(n)
-				}
+					if n == 0 {
+						finish(fmt.Errorf(
+							"reader %d phase %d: no progress",
+							id, phaseIndex,
+						))
+						return
+					}
 
-				if err != nil {
-					finish(fmt.Errorf(
-						"reader %d: read at %d: %w",
-						id, begin+received, err,
-					))
-					return
-				}
-				if n == 0 {
-					finish(fmt.Errorf(
-						"reader %d: no progress at %d",
-						id, begin+received,
-					))
-					return
-				}
+					if received >= nextProgress {
+						progress <- progressEvent{id, received}
+						nextProgress += 1 << 20
+					}
 
-				if received >= nextProgress {
-					progress <- progressEvent{id, received}
-					nextProgress += 1 << 20
+					// Pause A at 8 MiB. The second reader
+					// will seek to 48 MiB and resume us.
+					if seekScenario && id == 0 &&
+						!paused && received >= 8<<20 {
+
+						paused = true
+						close(aPaused)
+
+						select {
+						case <-resumeA:
+						case <-stop:
+							finish(fmt.Errorf("reader A canceled"))
+							return
+						}
+					}
 				}
 			}
 
@@ -310,10 +397,10 @@ func TestStreamingConcurrentReaders(t *testing.T) {
 			if result.err != nil {
 				t.Fatal(result.err)
 			}
-			if result.bytes != readLength {
+			if result.bytes != expectedBytes[result.id] {
 				t.Fatalf(
 					"reader %d read %d bytes, want %d",
-					result.id, result.bytes, readLength,
+					result.id, result.bytes, expectedBytes[result.id],
 				)
 			}
 			finished[result.id] = true
@@ -351,8 +438,8 @@ func TestStreamingConcurrentReaders(t *testing.T) {
 
 	t.Logf(
 		"both readers completed: A=%d B=%d MiB, peak RAM=%d MiB",
-		readLength>>20,
-		readLength>>20,
+		expectedBytes[0]>>20,
+		expectedBytes[1]>>20,
 		peakRAM>>20,
 	)
 }
