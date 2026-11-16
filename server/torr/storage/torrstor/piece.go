@@ -1,10 +1,9 @@
 package torrstor
 
 import (
-	"errors"
+	"fmt"
 	"github.com/anacrolix/torrent"
 	"github.com/anacrolix/torrent/storage"
-	"server/settings"
 	"sync"
 	"time"
 )
@@ -92,7 +91,7 @@ func NewPiece(id int, cache *Cache) *Piece {
 		cache: cache,
 	}
 
-	if !settings.BTsets.UseDisk {
+	if !cache.useDisk {
 		p.mPiece = NewMemPiece(p)
 	} else {
 		p.dPiece = NewDiskPiece(p)
@@ -101,19 +100,17 @@ func NewPiece(id int, cache *Cache) *Piece {
 }
 
 func (p *Piece) WriteAt(b []byte, off int64) (n int, err error) {
-	if !settings.BTsets.UseDisk {
+	if p.mPiece != nil {
 		return p.mPiece.WriteAt(b, off)
-	} else {
-		return p.dPiece.WriteAt(b, off)
 	}
+	return p.dPiece.WriteAt(b, off)
 }
 
 func (p *Piece) ReadAt(b []byte, off int64) (n int, err error) {
-	if !settings.BTsets.UseDisk {
+	if p.mPiece != nil {
 		return p.mPiece.ReadAt(b, off)
-	} else {
-		return p.dPiece.ReadAt(b, off)
 	}
+	return p.dPiece.ReadAt(b, off)
 }
 
 // memCost is what this piece costs the cache budget. In RAM mode that is the allocated buffer

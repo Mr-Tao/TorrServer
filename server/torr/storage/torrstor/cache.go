@@ -137,6 +137,10 @@ type Cache struct {
 	patchEnabled           bool
 	connectionsLimit       int
 	readerReadAheadPercent int64
+	useDisk                bool
+	savePath               string
+	removeCacheOnDrop      bool
+	autoCacheSize          bool
 }
 
 func NewCache(capacity int64, storage *Storage) *Cache {
@@ -159,6 +163,13 @@ func NewCache(capacity int64, storage *Storage) *Cache {
 		patchEnabled:           patchOn,
 		connectionsLimit:       connectionsLimit,
 		readerReadAheadPercent: readerReadAheadPercent,
+	}
+
+	if bt := settings.BTsets; bt != nil {
+		ret.useDisk = bt.UseDisk
+		ret.savePath = bt.TorrentsSavePath
+		ret.removeCacheOnDrop = bt.RemoveCacheOnDrop
+		ret.autoCacheSize = bt.CacheSize == 0
 	}
 
 	return ret

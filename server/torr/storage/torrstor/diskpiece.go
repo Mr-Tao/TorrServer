@@ -9,7 +9,6 @@ import (
 	"time"
 
 	"server/log"
-	"server/settings"
 )
 
 type DiskPiece struct {
@@ -21,7 +20,11 @@ type DiskPiece struct {
 }
 
 func NewDiskPiece(p *Piece) *DiskPiece {
-	name := filepath.Join(settings.BTsets.TorrentsSavePath, p.cache.hash.HexString(), strconv.Itoa(p.Id))
+	name := filepath.Join(
+		p.cache.savePath,
+		p.cache.hash.HexString(),
+		strconv.Itoa(p.Id),
+	)
 	ff, err := os.Stat(name)
 	if err == nil {
 		p.initMeta(
