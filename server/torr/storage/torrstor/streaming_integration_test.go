@@ -34,28 +34,33 @@ func localTorrentConfig() *torrent.ClientConfig {
 }
 
 func TestStreamingSegmentRedownload(t *testing.T) {
-	runStreamingRedownload(t, false, false, false, false)
+	runStreamingRedownload(t, false, false, false, false, false)
 }
 
 func TestStreamingWholePieceRelease(t *testing.T) {
-	runStreamingRedownload(t, true, false, false, false)
+	runStreamingRedownload(t, true, false, false, false, false)
 }
 
 func TestStreamingCompletedPieceRelease(t *testing.T) {
-	runStreamingRedownload(t, false, true, false, false)
+	runStreamingRedownload(t, false, true, false, false, false)
 }
 
 func TestStreamingProtectedSegmentRedownload(t *testing.T) {
-	runStreamingRedownload(t, false, false, true, false)
+	runStreamingRedownload(t, false, false, true, false, false)
 }
 
 func TestStreamingAutomaticSegmentEviction(t *testing.T) {
-	runStreamingRedownload(t, false, false, true, true)
+	runStreamingRedownload(t, false, false, true, true, false)
+}
+
+func TestStreamingCompletedSegmentRedownload(t *testing.T) {
+	runStreamingRedownload(t, false, false, false, false, true)
 }
 
 func runStreamingRedownload(
 	t *testing.T,
-	wholePiece, completedPiece, protectedEviction, automaticEviction bool,
+	wholePiece, completedPiece, protectedEviction,
+	automaticEviction, completedRedownload bool,
 ) {
 	// Configure an isolated RAM-cache test.
 	// Restore global settings after the test finishes.
@@ -192,7 +197,7 @@ func runStreamingRedownload(
 	// Leecher: our modified TorrServer RAM cache.
 	leechCapacity := int64(16 << 20)
 
-	if protectedEviction {
+	if protectedEviction || completedRedownload {
 		leechCapacity = 128 << 10
 	}
 
@@ -225,7 +230,7 @@ func runStreamingRedownload(
 
 	preparationLockHeld := false
 
-	if protectedEviction {
+	if protectedEviction || completedRedownload {
 		// Keep downloaded segments in RAM until the test has
 		// established its protected reader.
 		leechCache.muRemove.Lock()
@@ -245,9 +250,12 @@ func runStreamingRedownload(
 	reader.SetResponsive()
 	reader.SetReadahead(256 << 10)
 
-	ctx, cancel := context.WithTimeout(
-		context.Background(), 30*time.Second,
-	)
+	readTimeout := 30 * time.Second
+	if completedRedownload {
+		readTimeout = 75 * time.Second
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), readTimeout)
 	defer cancel()
 
 	// Receive the first 16 KiB from the real seeder.
@@ -262,6 +270,112 @@ func runStreamingRedownload(
 
 	if leechTorrent.PieceState(0).Completion.Complete {
 		t.Fatal("piece completed before discard")
+	}
+	if completedRedownload {
+		m := leechCache.pieces[0].mPiece
+
+		// Read and verify an arbitrary remaining range using
+		// the real peer-to-peer torrent reader.
+		readAndCheck := func(label string, start int64) {
+			if _, err := reader.Seek(start, io.SeekStart); err != nil {
+				t.Fatal(err)
+			}
+
+			buf := make([]byte, 64<<10)
+
+			for pos := start; pos < pieceLength; {
+				want := int(min(int64(len(buf)), pieceLength-pos))
+				n, err := reader.ReadContext(ctx, buf[:want])
+
+				if n > 0 && !bytes.Equal(
+					buf[:n], data[int(pos):int(pos)+n],
+				) {
+					t.Fatalf("%s: data mismatch at %d", label, pos)
+				}
+
+				pos += int64(n)
+
+				if err != nil &&
+					!(errors.Is(err, io.EOF) && pos == pieceLength) {
+					t.Fatalf("%s: read at %d: %v", label, pos, err)
+				}
+
+				if n == 0 {
+					t.Fatalf("%s: no progress at %d", label, pos)
+				}
+			}
+		}
+
+		waitComplete := func(label string) {
+			deadline := time.Now().Add(8 * time.Second)
+
+			for !leechTorrent.PieceState(0).Completion.Complete {
+				if time.Now().After(deadline) {
+					t.Fatalf(
+						"%s: piece not complete, missing=%d",
+						label,
+						leechTorrent.PieceBytesMissing(0),
+					)
+				}
+				time.Sleep(10 * time.Millisecond)
+			}
+		}
+
+		// Finish downloading the entire 4 MiB piece.
+		readAndCheck("initial download", blockSize)
+		waitComplete("initial download")
+
+		if missing := leechTorrent.PieceBytesMissing(0); missing != 0 {
+			t.Fatalf("complete piece missing %d bytes", missing)
+		}
+
+		if allocated := m.allocated(); allocated != pieceLength {
+			t.Fatalf("allocated %d, want %d", allocated, pieceLength)
+		}
+
+		// Recompute physical RAM usage before explicit eviction.
+		// muRemove is still held by the test.
+		leechCache.getRemPiecesX(false, false)
+
+		freed, err := leechCache.evictRAMSegments()
+		if err != nil {
+			t.Fatalf("completed piece eviction: %v", err)
+		}
+
+		if freed != ramEvictionBatchBytes {
+			t.Fatalf(
+				"freed %d bytes, want %d",
+				freed, ramEvictionBatchBytes,
+			)
+		}
+
+		if leechTorrent.PieceState(0).Completion.Complete {
+			t.Fatal("partially evicted piece remains complete")
+		}
+
+		if missing := leechTorrent.PieceBytesMissing(0); missing != freed {
+			t.Fatalf(
+				"missing %d bytes after eviction, want %d",
+				missing, freed,
+			)
+		}
+
+		// Fetch the missing chunks from the real seeder.
+		// Preserved chunks should remain available locally.
+		readAndCheck("redownload", 0)
+		waitComplete("redownload")
+
+		if missing := leechTorrent.PieceBytesMissing(0); missing != 0 {
+			t.Fatalf("redownload left %d missing bytes", missing)
+		}
+
+		// This is the critical end-to-end assertion.
+		if !leechTorrent.PieceState(0).Completion.Complete {
+			t.Fatal("piece did not become complete again")
+		}
+
+		t.Log("completed piece successfully evicted and reverified")
+		return
 	}
 	if wholePiece {
 		before := leechTorrent.PieceBytesMissing(0)

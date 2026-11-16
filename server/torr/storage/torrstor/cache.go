@@ -840,7 +840,9 @@ func (c *Cache) evictRAMSegments() (freed int64, err error) {
 			)
 
 			for _, offset := range offsets {
-				if c.filled-freed <= c.capacity {
+				// Essential: check the batch limit for EVERY segment.
+				if c.filled-freed <= c.capacity ||
+					freed >= ramEvictionBatchBytes {
 					break
 				}
 
