@@ -422,6 +422,11 @@ func (t *Torrent) Status() *state.TorrentStatus {
 	t.muTorrent.Lock()
 	defer t.muTorrent.Unlock()
 
+	return t.statusLocked()
+}
+
+// statusLocked requires muTorrent to be held.
+func (t *Torrent) statusLocked() *state.TorrentStatus {
 	st := new(state.TorrentStatus)
 
 	st.Stat = t.Stat
@@ -507,10 +512,15 @@ func (t *Torrent) Status() *state.TorrentStatus {
 }
 
 func (t *Torrent) CacheState() *cacheSt.CacheState {
-	if t.Torrent != nil && t.cache != nil {
-		st := t.cache.GetState()
-		st.Torrent = t.Status()
-		return st
+	t.muTorrent.Lock()
+	defer t.muTorrent.Unlock()
+
+	if t.Stat == state.TorrentClosed ||
+		t.Torrent == nil || t.cache == nil {
+		return nil
 	}
-	return nil
+
+	st := t.cache.GetState()
+	st.Torrent = t.statusLocked()
+	return st
 }
