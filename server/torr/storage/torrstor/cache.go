@@ -283,6 +283,11 @@ func (c *Cache) Piece(m metainfo.Piece) storage.PieceImpl {
 }
 
 func (c *Cache) Close() error {
+	started := time.Now()
+	log.TLogln("Cache close begin:", c.hash)
+	defer func() {
+		log.TLogln("Cache close done:", c.hash, time.Since(started))
+	}()
 	if torr := c.getTorrent(); torr != nil {
 		log.TLogln("Close cache for:", torr.Name(), c.hash)
 	} else {
@@ -290,7 +295,10 @@ func (c *Cache) Close() error {
 	}
 	c.isClosed.Store(true)
 
+	phase := time.Now()
 	c.storage.removeCache(c.hash)
+	log.TLogln("Cache unregister done:", c.hash, time.Since(phase))
+	phase = time.Now()
 
 	if settings.BTsets.RemoveCacheOnDrop {
 		name := filepath.Join(settings.BTsets.TorrentsSavePath, c.hash.HexString())
@@ -304,15 +312,23 @@ func (c *Cache) Close() error {
 		}
 	}
 
+	log.TLogln("Cache disk cleanup done:", c.hash, time.Since(phase))
+	phase = time.Now()
 	c.muReaders.Lock()
 	c.readers = nil
 	c.muReaders.Unlock()
+	log.TLogln("Cache readers cleared:", c.hash, time.Since(phase))
 
+	phase = time.Now()
 	c.muPieces.Lock()
 	c.pieces = nil
 	c.muPieces.Unlock()
+	log.TLogln("Cache pieces cleared:", c.hash, time.Since(phase))
 
+	log.TLogln("Cache GC begin:", c.hash)
+	phase = time.Now()
 	utils.FreeOSMemGC()
+	log.TLogln("Cache GC done:", c.hash, time.Since(phase))
 	return nil
 }
 
