@@ -325,6 +325,14 @@ func (c *Cache) Close() error {
 	c.muPieces.Unlock()
 	log.TLogln("Cache pieces cleared:", c.hash, time.Since(phase))
 
+	phase = time.Now()
+	c.muActive.Lock()
+	activeCount := len(c.active)
+	clear(c.active)
+	c.muActive.Unlock()
+	log.TLogln("Cache active cleared:", c.hash, activeCount,
+		"pieces", time.Since(phase))
+
 	log.TLogln("Cache GC begin:", c.hash)
 	phase = time.Now()
 	utils.FreeOSMemGC()
@@ -498,7 +506,7 @@ func (c *Cache) cleanPieces() {
 			}
 
 			if released {
-				utils.FreeOSMemGC()
+				utils.FreeOSMemGCThrottled()
 			}
 		}
 		stats.cleanNs.Add(int64(time.Since(t0)))

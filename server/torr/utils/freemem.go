@@ -3,7 +3,7 @@ package utils
 import (
 	"runtime"
 	"runtime/debug"
-	"sync/atomic"
+	"sync"
 	"time"
 )
 
@@ -16,14 +16,28 @@ func FreeOSMemGC() {
 	debug.FreeOSMemory()
 }
 
-var lastGC atomic.Int64
+const gcInterval = 4 * time.Second
 
-// FreeOSMemGCThrottled runs a real GC + scavenge at most once per 10 s, asynchronously.
+var (
+	gcMu   sync.Mutex
+	lastGC time.Time
+)
+
+// FreeOSMemGCThrottled asynchronously runs at most one
+// GC and scavenge operation per gcInterval.
 func FreeOSMemGCThrottled() {
-	now := time.Now().UnixNano()
-	last := lastGC.Load()
-	if now-last < 4e9 || !lastGC.CompareAndSwap(last, now) {
+	if !gcMu.TryLock() {
 		return
 	}
-	go FreeOSMemGC()
+
+	if time.Since(lastGC) < gcInterval {
+		gcMu.Unlock()
+		return
+	}
+
+	go func() {
+		defer gcMu.Unlock()
+		lastGC = time.Now()
+		FreeOSMem()
+	}()
 }
