@@ -113,6 +113,8 @@ func TestStreamBufferHTTPRanges(t *testing.T) {
 }
 
 func TestStreamBufferMultipartAndHead(t *testing.T) {
+	t.Setenv("GODEBUG", "httpservecontentmaxranges=200")
+
 	data := bytes.Repeat([]byte("abcdefghijklmnopqrstuvwxyz"), 100000)
 	for _, method := range []string{http.MethodGet, http.MethodHead} {
 		req := httptest.NewRequest(method, "http://local/video.mkv", nil)
@@ -120,6 +122,18 @@ func TestStreamBufferMultipartAndHead(t *testing.T) {
 		a, b := httptest.NewRecorder(), httptest.NewRecorder()
 		http.ServeContent(a, req, "video.mkv", time.Unix(1, 0), bytes.NewReader(data))
 		http.ServeContent(b, req, "video.mkv", time.Unix(1, 0), newBufferedStreamReader(bytes.NewReader(data), 1<<20))
+		t.Logf("%s Range=%q", method, req.Header.Get("Range"))
+
+		t.Logf("unbuffered: status=%d headers=%v bodyLen=%d",
+			a.Code, a.Header(), a.Body.Len())
+
+		t.Logf("buffered:   status=%d headers=%v bodyLen=%d",
+			b.Code, b.Header(), b.Body.Len())
+
+		if a.Code != http.StatusPartialContent ||
+			b.Code != http.StatusPartialContent {
+			t.Fatal("expected 206 Partial Content")
+		}
 		if a.Code != b.Code || a.Header().Get("Content-Length") != b.Header().Get("Content-Length") {
 			t.Fatal("headers differ")
 		}
@@ -130,9 +144,13 @@ func TestStreamBufferMultipartAndHead(t *testing.T) {
 			continue
 		}
 		decode := func(resp *httptest.ResponseRecorder) [][]byte {
-			_, params, err := mime.ParseMediaType(resp.Header().Get("Content-Type"))
+			mediaType, params, err := mime.ParseMediaType(resp.Header().Get("Content-Type"))
 			if err != nil {
 				t.Fatal(err)
+			}
+			if mediaType != "multipart/byteranges" || params["boundary"] == "" {
+				t.Fatalf("expected multipart response, got %q",
+					resp.Header().Get("Content-Type"))
 			}
 			reader := multipart.NewReader(bytes.NewReader(resp.Body.Bytes()), params["boundary"])
 			var parts [][]byte
