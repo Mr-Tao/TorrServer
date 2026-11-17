@@ -70,8 +70,18 @@ func (c *Cache) statsLoop() {
 
 func (c *Cache) markActive(p *Piece) {
 	c.muActive.Lock()
-	c.active[p.Id] = p
+	if !c.isClosed.Load() {
+		c.active[p.Id] = p
+	}
 	c.muActive.Unlock()
+}
+
+func (c *Cache) clearActive() int {
+	c.muActive.Lock()
+	defer c.muActive.Unlock()
+	n := len(c.active)
+	clear(c.active)
+	return n
 }
 
 func (c *Cache) unmarkActive(id int) {
@@ -326,12 +336,9 @@ func (c *Cache) Close() error {
 	log.TLogln("Cache pieces cleared:", c.hash, time.Since(phase))
 
 	phase = time.Now()
-	c.muActive.Lock()
-	activeCount := len(c.active)
-	clear(c.active)
-	c.muActive.Unlock()
-	log.TLogln("Cache active cleared:", c.hash, activeCount,
-		"pieces", time.Since(phase))
+	activeCount := c.clearActive()
+	log.TLogln("Cache active cleared:", c.hash,
+		activeCount, "pieces", time.Since(phase))
 
 	log.TLogln("Cache GC begin:", c.hash)
 	phase = time.Now()
