@@ -72,9 +72,11 @@ func (s *Storage) Close() error {
 	return nil
 }
 
-func (s *Storage) removeCache(hash metainfo.Hash) {
+func (s *Storage) removeCache(hash metainfo.Hash, expected *Cache) {
 	s.mu.Lock()
-	delete(s.caches, hash)
+	if s.caches[hash] == expected {
+		delete(s.caches, hash)
+	}
 	s.mu.Unlock()
 }
 

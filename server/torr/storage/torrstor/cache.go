@@ -306,7 +306,7 @@ func (c *Cache) Close() error {
 	c.isClosed.Store(true)
 
 	phase := time.Now()
-	c.storage.removeCache(c.hash)
+	c.storage.removeCache(c.hash, c)
 	log.TLogln("Cache unregister done:", c.hash, time.Since(phase))
 	phase = time.Now()
 
