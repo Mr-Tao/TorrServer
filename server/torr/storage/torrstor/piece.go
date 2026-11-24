@@ -52,6 +52,21 @@ func (p *Piece) noteWrite(n int, length int64) {
 	p.Accessed = time.Now().Unix()
 }
 
+// subtractWritten adjusts the logical downloaded byte count when a RAM
+// segment is discarded. The storage caller holds MemPiece.mu, so writes,
+// discards and their accounting cannot interleave on the same piece.
+func (p *Piece) subtractWritten(n int64) {
+	if n <= 0 {
+		return
+	}
+	p.metaMu.Lock()
+	p.Size -= n
+	if p.Size < 0 {
+		p.Size = 0
+	}
+	p.metaMu.Unlock()
+}
+
 func (p *Piece) touch() {
 	p.metaMu.Lock()
 	p.Accessed = time.Now().Unix()
