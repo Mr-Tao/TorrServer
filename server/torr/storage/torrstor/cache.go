@@ -42,7 +42,8 @@ var inflightLimit = func() int {
 
 type cacheStats struct {
 	cleanCalls, cleanSkipped, cleanRuns, getRemCalls, getRemFull  atomic.Int64
-	clrCalls, clrFull, pieceStateCalls, removed, scanned, gcCalls atomic.Int64
+	clrCalls, clrFull, pieceStateCalls, scanned, gcCalls atomic.Int64
+	evictedSegments, evictedBytes, evictionBusy                     atomic.Int64
 	getRemNs, clrNs, gcNs, cleanNs                                atomic.Int64
 }
 
@@ -56,15 +57,16 @@ func (c *Cache) statsLoop() {
 		sc := stats.scanned.Swap(0)
 		cn, cf, cms, ps := stats.clrCalls.Swap(0), stats.clrFull.Swap(0), stats.clrNs.Swap(0)/1e6, stats.pieceStateCalls.Swap(0)
 		gcn, gcms := stats.gcCalls.Swap(0), stats.gcNs.Swap(0)/1e6
-		rm, clms := stats.removed.Swap(0), stats.cleanNs.Swap(0)/1e6
+		es, eb, busy := stats.evictedSegments.Swap(0), stats.evictedBytes.Swap(0), stats.evictionBusy.Swap(0)
+		clms := stats.cleanNs.Swap(0) / 1e6
 		if cc+gn+cn == 0 {
 			continue
 		}
 		c.muActive.Lock()
 		na := len(c.active)
 		c.muActive.Unlock()
-		log.TLogln(fmt.Sprintf("[CSTAT patch=%v] clean calls=%d skipped=%d runs=%d busy=%dms | getRem n=%d full=%d %dms scanned=%d | clearPrio n=%d full=%d %dms pstate=%d | gc n=%d %dms | removed=%d | active=%d filled=%dMB cap=%dMB readers=%d",
-			c.patchEnabled, cc, sk, cr, clms, gn, gf, gms, sc, cn, cf, cms, ps, gcn, gcms, rm, na, c.statFilled.Load()>>20, c.capacity>>20, len(c.readersSnapshot())))
+		log.TLogln(fmt.Sprintf("[CSTAT patch=%v] clean calls=%d skipped=%d runs=%d busy=%dms | getRem n=%d full=%d %dms scanned=%d | clearPrio n=%d full=%d %dms pstate=%d | gc n=%d %dms | evict segments=%d bytes=%d busy=%d | active=%d filled=%dMB cap=%dMB readers=%d",
+			c.patchEnabled, cc, sk, cr, clms, gn, gf, gms, sc, cn, cf, cms, ps, gcn, gcms, es, eb, busy, na, c.statFilled.Load()>>20, c.capacity>>20, len(c.readersSnapshot())))
 	}
 }
 
@@ -898,6 +900,7 @@ func (c *Cache) evictRAMSegments() (freed int64, err error) {
 
 				_, discardErr := p.mPiece.DiscardSegment(offset)
 				if errors.Is(discardErr, torrent.ErrChunkDiscardBusy) {
+					stats.evictionBusy.Add(1)
 					continue
 				}
 				if discardErr != nil {
@@ -909,7 +912,10 @@ func (c *Cache) evictRAMSegments() (freed int64, err error) {
 
 				after := p.mPiece.allocated()
 				if after < before {
-					freed += before - after
+					reclaimed := before - after
+					freed += reclaimed
+					stats.evictedSegments.Add(1)
+					stats.evictedBytes.Add(reclaimed)
 					// DiscardChunkRange invalidates downloaded chunks. If no
 					// reader wants any part of this piece, leaving its old
 					// Now/Next/Readahead priority would immediately request
