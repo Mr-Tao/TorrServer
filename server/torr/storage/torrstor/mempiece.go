@@ -16,7 +16,10 @@ type MemPiece struct {
 	// Segments are allocated lazily. An absent segment
 	// does not consume payload memory.
 	segments map[int64][]byte
-	bytes    int64
+	// Unique written byte ranges per segment, used for accurate Size
+	// accounting when segments are discarded and re-downloaded.
+	written map[int64][]writtenSpan
+	bytes   int64
 
 	lastCleanupBytes int64
 	mu               sync.RWMutex
@@ -45,9 +48,11 @@ func (p *MemPiece) WriteAt(b []byte, off int64) (n int, err error) {
 
 	if p.segments == nil {
 		p.segments = make(map[int64][]byte)
+		p.written = make(map[int64][]writtenSpan)
 	}
 
 	wasEmpty := p.bytes == 0
+	var newlyWritten int64
 
 	for n < len(b) {
 		idx := off / memSegmentSize
@@ -66,11 +71,18 @@ func (p *MemPiece) WriteAt(b []byte, off int64) (n int, err error) {
 
 		segOff := int(off % memSegmentSize)
 		count := copy(seg[segOff:], b[n:])
+		var added int64
+		p.written[idx], added = addWrittenSpan(
+			p.written[idx], int64(segOff), int64(segOff+count),
+		)
+		newlyWritten += added
 		n += count
 		off += int64(count)
 	}
 
-	p.piece.noteWrite(n, length)
+	// Count unique bytes, not the raw WriteAt length: a peer may
+	// retransmit a chunk already present in this RAM segment.
+	p.piece.noteWrite(int(newlyWritten), length)
 
 	if wasEmpty {
 		p.piece.cache.markActive(p.piece)
@@ -152,6 +164,7 @@ func (p *MemPiece) Release() {
 	defer p.mu.Unlock()
 
 	p.segments = nil
+	p.written = nil
 	p.bytes = 0
 	p.lastCleanupBytes = 0
 
@@ -224,10 +237,17 @@ func (p *MemPiece) discardSegmentWith(
 		if seg, ok := p.segments[index]; ok {
 			delete(p.segments, index)
 			p.bytes -= int64(cap(seg))
+
+			// The torrent engine invalidates this segment's chunks
+			// before invoking the callback. Subtract only the bytes
+			// that were really written here, not the allocated size.
+			p.piece.subtractWritten(writtenSpanBytes(p.written[index]))
+			delete(p.written, index)
 		}
 
 		if p.bytes == 0 {
 			p.segments = nil
+			p.written = nil
 			p.lastCleanupBytes = 0
 			p.piece.clearSize()
 			p.piece.cache.unmarkActive(p.piece.Id)
