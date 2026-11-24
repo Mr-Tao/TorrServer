@@ -2,7 +2,9 @@
 
 This branch combines the two cache fixes validated by playback tests with an
 opt-in OpenSSL piece SHA-1 implementation in a **separate torrent module**.
-The experimental file-edge retention policy is deliberately excluded.
+The experimental file-edge retention policy is deliberately excluded. RAM
+segment eviction counters (`evict segments`, `bytes`, and `busy`) are retained
+independently to enable baseline measurements without metadata pinning.
 
 ## Exact source versions
 
