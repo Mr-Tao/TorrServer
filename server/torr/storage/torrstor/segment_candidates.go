@@ -73,6 +73,7 @@ func selectEvictableRAMSegments(
 
 	return candidates
 }
+
 // pieceOverlapsProtectedIntervals reports whether any reader-protected byte
 // intersects the piece. Segment eviction may discard bytes outside a reader's
 // window, but the piece must retain its priority if a reader still needs some
