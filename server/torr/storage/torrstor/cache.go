@@ -873,6 +873,12 @@ func (c *Cache) evictRAMSegments() (freed int64, err error) {
 			}
 
 			pieceStart := int64(id) * c.pieceLength
+			// A reader may still need other segments of this very piece.
+			// Keep its priority as long as any protected byte overlaps it.
+			keepPriority := pieceOverlapsProtectedIntervals(
+				pieceStart, pieceLength, protected,
+			)
+			priorityCleared := false
 
 			offsets := p.mPiece.evictableSegmentOffsets(
 				pieceStart,
@@ -904,6 +910,17 @@ func (c *Cache) evictRAMSegments() (freed int64, err error) {
 				after := p.mPiece.allocated()
 				if after < before {
 					freed += before - after
+					// DiscardChunkRange invalidates downloaded chunks. If no
+					// reader wants any part of this piece, leaving its old
+					// Now/Next/Readahead priority would immediately request
+					// those same chunks again and cause a download/evict loop.
+					//
+					// Do this only after a successful discard and at most
+					// once per piece, including when a later discard fails.
+					if !keepPriority && !priorityCleared {
+						torr.Piece(id).SetPriority(torrent.PiecePriorityNone)
+						priorityCleared = true
+					}
 				}
 			}
 		}
