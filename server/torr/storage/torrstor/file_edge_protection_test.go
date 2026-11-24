@@ -1,7 +1,6 @@
 package torrstor
 
 import (
-	"io"
 	"reflect"
 	"testing"
 )
@@ -165,5 +164,4 @@ func TestFileEdgeProtectionSelectsActualRAMSegments(t *testing.T) {
 	if !reflect.DeepEqual(allOffsets, allocated) {
 		t.Fatalf("head still protected without readers: %v", allOffsets)
 	}
-	_ = io.EOF // This test never reads data; it exercises candidate selection.
 }
