@@ -238,24 +238,40 @@ func TestStreamingLargePieceMemoryBound(t *testing.T) {
 		out.forward = time.Since(start)
 
 		if out.err == nil {
-			// The playback window has advanced to the end.
-			// Wait for automatic eviction of the first segment.
+			// The playback window has advanced to the end. With file-edge
+			// protection the first segment must remain cached, while older
+			// data outside the head guard must still be evicted to honor
+			// the 32 MiB RAM budget. For this test, head protection is
+			// 4 MiB (half the quarter-cache metadata budget).
+			const staleOffset int64 = 8 << 20
 			deadline := time.Now().Add(5 * time.Second)
 
 			for {
-				found := false
-				for _, off := range m.allocatedSegmentOffsets() {
+				segments := m.allocatedSegmentOffsets()
+				headCached := false
+				staleCached := false
+				for _, off := range segments {
 					if off == 0 {
-						found = true
-						break
+						headCached = true
+					}
+					if off == staleOffset {
+						staleCached = true
 					}
 				}
-				if !found {
+
+				if !headCached {
+					out.err = fmt.Errorf(
+						"first segment was evicted despite active file-edge protection",
+					)
+					break
+				}
+				if !staleCached {
 					break
 				}
 				if time.Now().After(deadline) {
 					out.err = fmt.Errorf(
-						"first segment was not automatically evicted",
+						"unprotected segment at %d MiB was not automatically evicted",
+						staleOffset>>20,
 					)
 					break
 				}
