@@ -128,19 +128,16 @@ func protectedIntervalsFromSnapshots(
 	return protected
 }
 
-// protectedByteIntervals collects reader snapshots without
-// holding muReaders while acquiring individual reader locks.
-func (c *Cache) protectedByteIntervals() []byteInterval {
+// readerWindowSnapshots collects reader information without holding
+// muReaders while acquiring individual reader locks.
+func (c *Cache) readerWindowSnapshots() []readerWindowSnapshot {
 	readers := c.readersSnapshot()
 	windows := make([]readerWindowSnapshot, 0, len(readers))
-
 	for _, r := range readers {
 		if r.file == nil {
 			continue
 		}
-
 		state, ranges, unknown := r.stateWithReadsSnapshot()
-
 		windows = append(windows, readerWindowSnapshot{
 			state:           state,
 			fileStart:       r.file.Offset(),
@@ -148,16 +145,41 @@ func (c *Cache) protectedByteIntervals() []byteInterval {
 			inFlightReads:   ranges,
 			unknownInFlight: unknown,
 		})
-
 	}
+	return windows
+}
 
-	percent := c.readerReadAheadPercent
-
+// protectedByteIntervals preserves the existing reader-only contract, used
+// by other cache callers and tests.
+func (c *Cache) protectedByteIntervals() []byteInterval {
 	return protectedIntervalsFromSnapshots(
-		windows,
+		c.readerWindowSnapshots(),
 		c.capacity,
-		percent,
+		c.readerReadAheadPercent,
 	)
+}
+
+// withStableEvictionWindows keeps reader registration and final close out of
+// the eviction pass. Both protection policies use the same reader snapshot.
+// Metadata retention must NOT influence priority clearing: pieces outside
+// actual playback windows must not retain stale download priorities.
+func (c *Cache) withStableEvictionWindows(
+	fn func(readerProtected, allProtected []byteInterval) error,
+) error {
+	c.evictionMu.Lock()
+	defer c.evictionMu.Unlock()
+
+	windows := c.readerWindowSnapshots()
+	readerProtected := protectedIntervalsFromSnapshots(
+		windows, c.capacity, c.readerReadAheadPercent,
+	)
+	edgeProtected := fileEdgeProtectedIntervals(
+		windows, c.capacity, c.pieceLength, memSegmentSize,
+	)
+	allProtected := make([]byteInterval, 0, len(readerProtected)+len(edgeProtected))
+	allProtected = append(allProtected, readerProtected...)
+	allProtected = append(allProtected, edgeProtected...)
+	return fn(readerProtected, allProtected)
 }
 
 // readerInFlightIntervals returns the byte ranges that must remain
